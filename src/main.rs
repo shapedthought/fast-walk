@@ -24,7 +24,8 @@ struct Cli {
     max_depth: usize,
 
     #[clap(short, long, default_value_t = num_cpus::get(), value_parser)]
-    threads: usize,
+    threads: usize
+
 }
 
 fn main() -> Result<()> {
@@ -84,10 +85,6 @@ fn main() -> Result<()> {
 
     let sum_vec: Vec<(&String, &i64)> = capacity.iter().collect();
 
-    // let mut file = File::create("results.txt")?;
-    let mut wtr = csv::Writer::from_path("results.csv")?;
-    wtr.write_record(&["Extention", "Qty", "Cap Bytes"])?;
-
     let mut table = Table::new();
 
     table
@@ -97,6 +94,9 @@ fn main() -> Result<()> {
         .set_header(vec!["Extension", "Quantity", "Capacity Bytes"]);
 
     let mut table_index = 0;
+
+    let mut wtr = csv::Writer::from_path("results.csv")?;
+    wtr.write_record(&["Extension", "Qty", "Cap Bytes"])?;
 
     for i in &count_vec {
         let cap = sum_vec.iter().filter(|x| x.0 == i.0).last().unwrap();
