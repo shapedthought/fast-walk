@@ -6,6 +6,8 @@ use jwalk::{Parallelism, WalkDir};
 use spinners::{Spinner, Spinners};
 use std::collections::HashMap;
 use std::time::Instant;
+use randomizer::Randomizer;
+
 
 // use std::thread::sleep;
 // use std::time::Duration;
@@ -95,7 +97,11 @@ fn main() -> Result<()> {
 
     let mut table_index = 0;
 
-    let mut wtr = csv::Writer::from_path("results.csv")?;
+    let ran_string = Randomizer::ALPHANUMERIC(6).string().unwrap();
+
+    let file_name = format!("results-{}.csv", ran_string);
+
+    let mut wtr = csv::Writer::from_path(file_name)?;
     wtr.write_record(&["Extension", "Qty", "Cap Bytes"])?;
 
     for i in &count_vec {
