@@ -1,0 +1,17 @@
+[package]
+name = "fast-walk"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+jwalk = "0.6.0"
+anyhow = "1.0.58"
+filetime = "0.2.17"
+csv = "1.1.6"
+spinners = "4.1.0"
+num_cpus = "1.13.1"
+colored = "2.0.0"
+clap = { version = "3.2.20", features = ["derive"] }
+comfy-table = "6.1.0"
