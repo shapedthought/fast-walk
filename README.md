@@ -43,6 +43,8 @@ Max tests are around 5-6 million files per-hour depending on thread count.
 
 Tools outputs a CSV of the extensions arranged by quantity, also includes total capacit in bytes.
 
+Note that the tool takes each file's name, splits it at the ".", the uses the last item to get the extension. If the file does not have an extension it will return the file's name.
+
 The top 10 files are displayed in a table in the terminal. 
 
 <img src="output.png" alt="output" width="300"/>
