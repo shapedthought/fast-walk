@@ -115,7 +115,7 @@ fn main() -> Result<()> {
     println!("\nThat took: {:?}", duration);
 
     println!(
-        "\nTotal Files: {}, Total Cap: {}",
+        "\nTotal Files: {}, Total Cap: {} MB",
         total_files.to_string().green(),
         (total_cap / (1024 * 1024)).to_string().bright_purple()
     );
