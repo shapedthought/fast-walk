@@ -37,8 +37,6 @@ App uses the total system threads if threads are not set.
 
 Max depth can be useful for testing speed. 
 
-Max tests are around 5-6 million files per-hour depending on thread count.
-
 ## Output
 
 Tools outputs a CSV of the extensions arranged by quantity, also includes total capacit in bytes.
