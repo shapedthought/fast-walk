@@ -12,7 +12,6 @@ use randomizer::Randomizer;
 // use std::thread::sleep;
 // use std::time::Duration;
 use colored::*;
-use num_cpus;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -65,7 +64,7 @@ fn main() -> Result<()> {
                 .file_name()
                 .to_str()
                 .unwrap()
-                .split(".")
+                .split('.')
                 .collect::<Vec<&str>>();
 
             let size = entry.metadata()?.len();
@@ -102,7 +101,7 @@ fn main() -> Result<()> {
     let file_name = format!("results-{}.csv", ran_string);
 
     let mut wtr = csv::Writer::from_path(file_name)?;
-    wtr.write_record(&["Extension", "Qty", "Cap Bytes"])?;
+    wtr.write_record(["Extension", "Qty", "Cap Bytes"])?;
 
     for i in &count_vec {
         let cap = sum_vec.iter().filter(|x| x.0 == i.0).last().unwrap();
@@ -116,9 +115,10 @@ fn main() -> Result<()> {
         wtr.write_record(&[i.0.to_string(), i.1.to_string(), cap.1.to_string()])?;
     }
     wtr.flush()?;
-    let total_files = count_vec.iter().map(|x| x.1).fold(0, |a, x| a + x);
-    let total_cap = sum_vec.iter().map(|x| x.1).fold(0, |a, x| a + x);
-
+//    let total_files = count_vec.iter().map(|x| x.1).fold(0, |a, x| a + x);
+//    let total_cap = sum_vec.iter().map(|x| x.1).fold(0, |a, x| a + x);
+    let total_files: i32 = count_vec.iter().map(|x| x.1).sum();
+    let total_cap: i64 = sum_vec.iter().map(|x| x.1).sum();
     // sleep(Duration::from_secs(10));
     sp.stop();
 
