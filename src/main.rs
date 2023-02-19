@@ -3,14 +3,15 @@ use comfy_table::modifiers::{UTF8_ROUND_CORNERS, UTF8_SOLID_INNER_BORDERS};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::*;
 use jwalk::{Parallelism, WalkDir};
-use spinners::{Spinner, Spinners};
+// use spinners::{Spinner, Spinners};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use randomizer::Randomizer;
+use indicatif::ProgressBar;
+use rayon::prelude::*;
 
 
-// use std::thread::sleep;
-// use std::time::Duration;
 use colored::*;
 use std::path::PathBuf;
 
@@ -44,47 +45,57 @@ fn main() -> Result<()> {
         println!("Using {} threads", use_threads);
     }
 
-    let mut extensions = HashMap::new();
-    let mut capacity = HashMap::new();
+    let extensions = Arc::new(Mutex::new(HashMap::new()));
+    let capacity = Arc::new(Mutex::new(HashMap::new()));
 
-    let mut sp = Spinner::new(Spinners::Aesthetic, "Processing".into());
+    // let mut sp = Spinner::new(Spinners::Aesthetic, "Processing".into());
 
-    for entry in WalkDir::new(cli.path)
+    let files: Vec<_> = WalkDir::new(cli.path)
         .sort(true)
         .max_depth(cli.max_depth)
         .parallelism(Parallelism::RayonNewPool(use_threads))
-    {
-        let entry = &entry?;
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|d| d.file_type().is_file())
+        .collect();
 
-        let metadata = entry.metadata()?;
+    let bar = ProgressBar::new(files.len() as u64);
 
-        if metadata.is_file() {
-            // let metadata = entry.metadata()?;
-            let extention = entry
-                .file_name()
-                .to_str()
-                .unwrap()
-                .split('.')
-                .collect::<Vec<&str>>();
+    files.par_iter().for_each(|e| {
+        bar.inc(1);
+        let extention = e
+            .file_name()
+            .to_str()
+            .unwrap()
+            .split('.')
+            .collect::<Vec<&str>>();
 
-            let size = entry.metadata()?.len();
+        let size = e.metadata().unwrap().len();
 
-            extensions
-                .entry(extention.last().unwrap().to_string())
-                .and_modify(|counter| *counter += 1)
-                .or_insert(1);
+        extensions
+            .lock()
+            .unwrap()
+            .entry(extention.last().unwrap().to_string())
+            .and_modify(|counter| *counter += 1)
+            .or_insert(1);
 
-            capacity
-                .entry(extention.last().unwrap().to_string())
-                .and_modify(|counter| *counter += size as i64)
-                .or_insert(size as i64);
-        }
-    }
+        capacity
+            .lock()
+            .unwrap()
+            .entry(extention.last().unwrap().to_string())
+            .and_modify(|counter| *counter += size as i64)
+            .or_insert(size as i64);
+        
+    });
 
-    let mut count_vec: Vec<(&String, &i32)> = extensions.iter().collect();
+    let res_extention = extensions.lock().unwrap();
+    let res_capacity = capacity.lock().unwrap();
+
+
+    let mut count_vec: Vec<(&String, &i32)> = res_extention.iter().collect();
     count_vec.sort_by(|a, b| b.1.cmp(a.1));
 
-    let sum_vec: Vec<(&String, &i64)> = capacity.iter().collect();
+    let sum_vec: Vec<(&String, &i64)> = res_capacity.iter().collect();
 
     let mut table = Table::new();
 
@@ -92,7 +103,7 @@ fn main() -> Result<()> {
         .load_preset(UTF8_FULL)
         .apply_modifier(UTF8_ROUND_CORNERS)
         .apply_modifier(UTF8_SOLID_INNER_BORDERS)
-        .set_header(vec!["Extension", "Quantity", "Capacity Bytes"]);
+        .set_header(vec!["Extension", "Quantity", "Capacity MB"]);
 
     let mut table_index = 0;
 
@@ -101,13 +112,13 @@ fn main() -> Result<()> {
     let file_name = format!("results-{}.csv", ran_string);
 
     let mut wtr = csv::Writer::from_path(file_name)?;
-    wtr.write_record(["Extension", "Qty", "Cap Bytes"])?;
+    wtr.write_record(["Extension", "Qty", "Cap MB"])?;
 
     for i in &count_vec {
         let cap = sum_vec.iter().filter(|x| x.0 == i.0).last().unwrap();
 
         if table_index < 11 {
-            table.add_row(vec![i.0.to_string(), i.1.to_string(), cap.1.to_string()]);
+            table.add_row(vec![i.0.to_string(), i.1.to_string(), (cap.1 / 1024i64.pow(2)).to_string()]);
 
             table_index += 1;
         }
@@ -120,7 +131,7 @@ fn main() -> Result<()> {
     let total_files: i32 = count_vec.iter().map(|x| x.1).sum();
     let total_cap: i64 = sum_vec.iter().map(|x| x.1).sum();
     // sleep(Duration::from_secs(10));
-    sp.stop();
+    // sp.stop();
 
     let files_hour = (total_files as f32 / start.elapsed().as_secs_f32()) * 3600.00;
 
