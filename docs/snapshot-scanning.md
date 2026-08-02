@@ -101,12 +101,22 @@ Where the snapshots live depends on the server:
 | ZFS | `<mountpoint>/.zfs/snapshot/<name>` |
 | LVM and similar | mount the snapshot device separately |
 
+You need the `mount.nfs` helper, which comes from `nfs-common` on Debian and
+Ubuntu or `nfs-utils` on RHEL and Fedora. Without it, `mount` falls back to the
+raw system call and rejects options it cannot parse, reporting them as bad
+options rather than as a missing package:
+
+```sh
+sudo apt install nfs-common
+```
+
 Mount read-only:
 
 ```sh
 sudo mkdir -p /mnt/snapshot
 sudo mount -t nfs -o ro,soft,timeo=100,retrans=3 \
     nas.example.com:/vol/data /mnt/snapshot
+mount | grep nfs                   # confirm ro and the version actually took
 ```
 
 `soft` is deliberate. With the default `hard`, a server that stops responding
@@ -114,7 +124,12 @@ leaves the scan hung indefinitely and unkillable; with `soft` the operation
 fails, the failure surfaces as a `fast-walk` warning, and you know the totals
 are incomplete. Soft mounts are the wrong default for read-write workloads that
 can lose data, but a read-only scan cannot corrupt anything — the worst case is
-a visibly incomplete result.
+a visibly incomplete result. The trade is that a soft mount reports failures as
+a generic `Input/output error`, so when something goes wrong the real cause has
+to come from `dmesg` or the server rather than from `errno`.
+
+Pin `nfsvers=3` if the server is not a Unix NAS. Modern Linux negotiates NFSv4
+by default, which several implementations handle differently or not at all.
 
 Then scan the snapshot directly, rather than the live tree:
 
@@ -337,7 +352,13 @@ Verified against a Windows Server share mounted over SMB from Linux:
 
 Not verified, and written from documentation rather than practice:
 
-- Everything in the NFS section
+- Everything in the NFS section. An attempt was made against a Windows Server
+  NFS export, which reached a successful NFSv3 mount and then failed every
+  directory listing with `Input/output error`, surviving both `nordirplus` and
+  forcing the mount protocol to TCP, with nothing logged to `dmesg` to work
+  from. That says something about Windows Server for NFS and nothing about the
+  guidance here, which is written for NetApp and ZFS. The `nfs-common` and
+  `nfsvers` notes above did come out of it and are real.
 - Whether `snapshot=` actually mounts a shadow copy. The option is accepted:
   passing an `@GMT` token that matched no shadow copy failed with `-2` rather
   than being rejected as malformed, so the form is right. Reaching a real
