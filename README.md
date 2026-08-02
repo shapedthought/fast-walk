@@ -23,12 +23,15 @@ of them, so one download can be checked with:
 
     sha256sum -c SHA256SUMS --ignore-missing
 
-The Linux binaries are built on Ubuntu 22.04 and linked against its glibc. On
-an older distribution they may refuse to start, and the error will be about a
-missing `GLIBC_` version rather than anything to do with this tool. If that
-happens, use the container image or build from source; `objdump -T fast-walk |
-grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1` says which version it actually
-wants.
+The Linux binaries are built on Ubuntu 22.04, and both architectures come out
+needing **glibc 2.34 or newer**, measured from the built artifacts rather than
+assumed from the builder. That clears RHEL and Rocky 9, Ubuntu 22.04 and
+Debian 12; it does not clear RHEL 8, Debian 11 or Ubuntu 20.04, where the
+binary will refuse to start with an error about a missing `GLIBC_` version
+rather than anything to do with this tool. On those, use the container image or
+build from source. To check any binary yourself:
+
+    objdump -T fast-walk | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
 
 There is deliberately **no static musl build**, which is the usual answer to
 that problem. musl's allocator is poor under the concurrent allocation this
