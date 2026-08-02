@@ -1,0 +1,160 @@
+name: Binaries
+
+# Tagging builds and publishes a release. workflow_dispatch does everything
+# except publish, so the build can be exercised without spending a version
+# number on it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Building needs nothing but read. The publish job asks for more, on itself
+# rather than here, so a compromised build step cannot write to the repository.
+permissions:
+  contents: read
+
+jobs:
+  # A tag can be pushed at any commit, including one that never went green.
+  # Building first and asking questions later would publish it.
+  check:
+    name: Test, lint and format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add clippy rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  build:
+    name: ${{ matrix.target }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on the oldest sensible runner rather than the newest. A
+          # binary linked against a new glibc will not start on an older
+          # distribution, and this gets pointed at file servers, which are
+          # not where the newest userland lives.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # The cross compiler alone is not enough: without the target's libc
+          # development files the link fails on a missing Scrt1.o, which reads
+          # as a broken toolchain rather than a missing package.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            linker: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+
+      # Cross-compiling to arm64 needs a cross linker; cargo finds it through
+      # this variable rather than through anything in the repository.
+      - name: Install the cross linker
+        if: matrix.linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.linker }}
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+
+      # --locked so the published binary is built from the committed lock file
+      # and not from whatever resolved that morning.
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Work out the version
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="$(cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[0].version')-${GITHUB_SHA:0:7}"
+          fi
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+      # A tag that disagrees with Cargo.toml produces a release whose binary
+      # reports a different version than the release it is attached to, which
+      # is discovered later by somebody trying to reproduce a bug.
+      - name: Check the tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')"
+          if [ "v${manifest}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml ${manifest}" >&2
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          name="fast-walk-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/fast-walk.exe" "dist/${name}/"
+          else
+            cp "target/${{ matrix.target }}/release/fast-walk" "dist/${name}/"
+          fi
+          cp README.md LICENSE TESTING.md "dist/${name}/"
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${name}.zip" "${name}" >/dev/null
+          else
+            tar czf "${name}.tar.gz" "${name}"
+          fi
+          rm -rf "${name}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fast-walk-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    # The only job that writes anything, and the only one holding a token that
+    # can.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One file of checksums beats a checksum per asset: it can be verified
+      # in a single command after downloading whichever one you wanted.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*
