@@ -56,7 +56,11 @@ the tool exits with an error rather than reporting an empty scan.
 To run against an SMB or NFS share, scan a snapshot rather than the live tree:
 the results are consistent, production is left alone, and there is nothing to
 damage. See [docs/snapshot-scanning.md](docs/snapshot-scanning.md) for mounting,
-thread counts, and the snapshot directory traps to avoid.
+tuning, and the snapshot directory traps to avoid.
+
+A scan over SMB has been checked against a scan of the same tree taken locally
+on the server, and the two produce identical output. The `actimeo` mount option
+matters more than the thread count for large shares; both are covered there.
 
 ## Output
 
