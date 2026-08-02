@@ -28,6 +28,7 @@ Run app in terminal.
         -m, --max-depth <MAX_DEPTH>    [default: 18446744073709551615]
         -p, --path <PATH>
         -t, --threads <THREADS>        [default: 8]
+            --skip-hidden              Skip hidden files and directories
 
 Example running on the same directory as the application, max depth 5, threads 4
 
@@ -35,13 +36,25 @@ Example running on the same directory as the application, max depth 5, threads 4
 
 App uses the total system threads if threads are not set.
 
-Max depth can be useful for testing speed. 
+Max depth can be useful for testing speed.
+
+Hidden files and directories are included by default, so dot-directories such as
+`.git` count towards the totals. Pass `--skip-hidden` to leave them out.
+
+If a directory cannot be read it is reported as a warning and its contents are
+missing from the totals. If the path given to `--path` cannot be read at all,
+the tool exits with an error rather than reporting an empty scan.
 
 ## Output
 
-Tools outputs a CSV of the extensions arranged by quantity, also includes total capacit in bytes.
+Tools outputs a CSV of the extensions arranged by quantity, also includes total capacity in bytes.
 
-Note that the tool takes each file's name, splits it at the ".", the uses the last item to get the extension. If the file does not have an extension it will return the file's name.
+The extension is the part of the file name after the final ".", so `archive.tar.gz`
+counts as `gz`. Files with no extension are grouped under `<none>`; this includes
+dotfiles such as `.gitignore`, which are treated as having no extension rather
+than an extension of `gitignore`.
+
+The CSV reports capacity in bytes. The terminal table reports it in MB.
 
 The top 10 files are displayed in a table in the terminal. 
 
