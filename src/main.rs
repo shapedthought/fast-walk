@@ -70,6 +70,44 @@ fn colour_delta(text: String, delta: i64) -> ColoredString {
     }
 }
 
+/// Parse a size written as a plain byte count or with a K, M or G suffix, so
+/// thresholds can be given as `64K` rather than `65536`.
+fn parse_size(input: &str) -> Result<u64, String> {
+    const KB: u64 = 1024;
+
+    let text = input.trim();
+    if text.is_empty() {
+        return Err("expected a size such as 64K, 1MB or 4096".to_string());
+    }
+
+    let upper = text.to_ascii_uppercase();
+    let (digits, multiplier) = if let Some(rest) = strip_unit(&upper, 'K') {
+        (rest, KB)
+    } else if let Some(rest) = strip_unit(&upper, 'M') {
+        (rest, KB * KB)
+    } else if let Some(rest) = strip_unit(&upper, 'G') {
+        (rest, KB * KB * KB)
+    } else if let Some(rest) = upper.strip_suffix('B') {
+        (rest, 1)
+    } else {
+        (upper.as_str(), 1)
+    };
+
+    let value: u64 = digits.trim().parse().map_err(|_| {
+        format!("{input:?} is not a size; give a number optionally followed by K, M or G")
+    })?;
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("{input:?} is too large to be a size in bytes"))
+}
+
+/// Strip a unit letter, accepting both `64K` and `64KB`.
+fn strip_unit(text: &str, unit: char) -> Option<&str> {
+    text.strip_suffix(&format!("{unit}B"))
+        .or_else(|| text.strip_suffix(unit))
+}
+
 /// Share of a total, as a percentage string. Guards the empty-scan case.
 fn format_share(part: u64, whole: u64) -> String {
     if whole == 0 {
@@ -106,6 +144,15 @@ struct Cli {
     /// How many of the largest files to report. Zero turns the report off.
     #[clap(long, default_value_t = 10, value_parser)]
     top: usize,
+
+    /// How many small-file directories to report. Zero turns the report off.
+    #[clap(long, default_value_t = 10, value_parser)]
+    hotspots: usize,
+
+    /// Files this size or smaller count as small, for the small-file report.
+    /// Accepts a byte count or a K, M or G suffix.
+    #[clap(long, default_value = "64K", value_parser = parse_size, value_name = "SIZE")]
+    small_under: u64,
 
     /// Compare two results CSVs from earlier scans instead of scanning.
     #[clap(long, num_args = 2, value_names = ["OLD", "NEW"], value_parser)]
@@ -195,6 +242,8 @@ fn run_scan(cli: &Cli, path: &Path) -> Result<()> {
         threads: use_threads,
         skip_hidden: cli.skip_hidden,
         top: cli.top,
+        hotspots: cli.hotspots,
+        small_at_or_below: cli.small_under,
     };
 
     let progress = BarProgress::default();
@@ -241,6 +290,8 @@ fn run_scan(cli: &Cli, path: &Path) -> Result<()> {
 
     print_extension_table(&result, &written.extensions);
     print_age_table(&result);
+    print_size_table(&result);
+    print_hotspot_table(&result);
     print_largest_table(&result);
 
     for file in written.all() {
@@ -254,12 +305,19 @@ fn run_scan(cli: &Cli, path: &Path) -> Result<()> {
 struct WrittenFiles {
     extensions: String,
     ages: String,
+    sizes: String,
+    hotspots: Option<String>,
     largest: Option<String>,
 }
 
 impl WrittenFiles {
     fn all(&self) -> Vec<&str> {
-        let mut files = vec![self.extensions.as_str(), self.ages.as_str()];
+        let mut files = vec![
+            self.extensions.as_str(),
+            self.ages.as_str(),
+            self.sizes.as_str(),
+        ];
+        files.extend(self.hotspots.as_deref());
         files.extend(self.largest.as_deref());
         files
     }
@@ -294,6 +352,50 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
     }
     wtr.flush()?;
 
+    let total_files = result.total_files();
+    let sizes = format!("{}-size.csv", stem);
+    let mut wtr = csv::Writer::from_path(&sizes)?;
+    wtr.write_record(["Size", "Qty", "Pct Of Files", "Cap Bytes", "Pct Of Cap"])?;
+    for (band, bucket) in result.size_rows() {
+        wtr.write_record(&[
+            band.label().to_string(),
+            bucket.count.to_string(),
+            format_share(bucket.count, total_files),
+            bucket.bytes.to_string(),
+            format_share(bucket.bytes, total_cap),
+        ])?;
+    }
+    wtr.flush()?;
+
+    let hotspots = if result.hotspots.is_empty() {
+        None
+    } else {
+        let path = format!("{}-hotspots.csv", stem);
+        let mut wtr = csv::Writer::from_path(&path)?;
+        wtr.write_record([
+            "Directory",
+            "Files",
+            "Small Files",
+            "Pct Small",
+            "Cap Bytes",
+            "Small Cap Bytes",
+            "Avg Bytes",
+        ])?;
+        for hotspot in &result.hotspots {
+            wtr.write_record(&[
+                hotspot.directory.display().to_string(),
+                hotspot.stats.files.to_string(),
+                hotspot.stats.small_files.to_string(),
+                format_share(hotspot.stats.small_files, hotspot.stats.files),
+                hotspot.stats.bytes.to_string(),
+                hotspot.stats.small_bytes.to_string(),
+                format!("{:.0}", hotspot.stats.average_bytes()),
+            ])?;
+        }
+        wtr.flush()?;
+        Some(path)
+    };
+
     let largest = if result.largest.is_empty() {
         None
     } else {
@@ -310,6 +412,8 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
     Ok(WrittenFiles {
         extensions,
         ages,
+        sizes,
+        hotspots,
         largest,
     })
 }
@@ -351,6 +455,75 @@ fn print_age_table(result: &Scan) {
     }
 
     println!("\nBy age (last modified)");
+    println!("{table}");
+}
+
+fn print_size_table(result: &Scan) {
+    let rows = result.size_rows();
+    if rows.is_empty() {
+        return;
+    }
+
+    let total_cap = result.total_bytes();
+    let total_files = result.total_files();
+    let mut table = new_table(vec![
+        "Size",
+        "Quantity",
+        "% of Files",
+        "Capacity MB",
+        "% of Cap",
+    ]);
+
+    for (band, bucket) in &rows {
+        table.add_row(vec![
+            band.label().to_string(),
+            bucket.count.to_string(),
+            format_share(bucket.count, total_files),
+            format!("{:.2}", bucket.bytes as f64 / BYTES_PER_MB),
+            format_share(bucket.bytes, total_cap),
+        ]);
+    }
+
+    println!("\nBy file size");
+    println!("{table}");
+    println!(
+        "{} files ({} of the total) are {} or smaller, holding {} between them",
+        result.small_files,
+        format_share(result.small_files, result.total_files()),
+        format_size(result.small_at_or_below as f64),
+        format_size(result.small_bytes as f64)
+    );
+}
+
+fn print_hotspot_table(result: &Scan) {
+    if result.hotspots.is_empty() {
+        return;
+    }
+
+    let mut table = new_table(vec![
+        "Directory",
+        "Files",
+        "Small",
+        "% Small",
+        "Capacity MB",
+        "Avg Size",
+    ]);
+
+    for hotspot in &result.hotspots {
+        table.add_row(vec![
+            hotspot.directory.display().to_string(),
+            hotspot.stats.files.to_string(),
+            hotspot.stats.small_files.to_string(),
+            format_share(hotspot.stats.small_files, hotspot.stats.files),
+            format!("{:.2}", hotspot.stats.bytes as f64 / BYTES_PER_MB),
+            format_size(hotspot.stats.average_bytes()),
+        ]);
+    }
+
+    println!(
+        "\nDirectories holding the most files of {} or smaller",
+        format_size(result.small_at_or_below as f64)
+    );
     println!("{table}");
 }
 
@@ -535,5 +708,49 @@ mod tests {
     #[test]
     fn a_share_of_an_empty_scan_is_zero_not_a_division_by_zero() {
         assert_eq!(format_share(0, 0), "0.0%");
+    }
+
+    #[test]
+    fn sizes_parse_as_plain_byte_counts() {
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size("4096"), Ok(4096));
+        assert_eq!(parse_size("512B"), Ok(512));
+    }
+
+    #[test]
+    fn size_suffixes_are_accepted_with_or_without_the_b() {
+        assert_eq!(parse_size("64K"), Ok(64 * 1024));
+        assert_eq!(parse_size("64KB"), Ok(64 * 1024));
+        assert_eq!(parse_size("1M"), Ok(1024 * 1024));
+        assert_eq!(parse_size("1MB"), Ok(1024 * 1024));
+        assert_eq!(parse_size("2G"), Ok(2 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn size_suffixes_are_case_insensitive_and_tolerate_spacing() {
+        assert_eq!(parse_size("64k"), Ok(64 * 1024));
+        assert_eq!(parse_size("  64 kb  "), Ok(64 * 1024));
+    }
+
+    #[test]
+    fn a_size_that_is_not_a_number_is_rejected_with_guidance() {
+        let err = parse_size("big").unwrap_err();
+
+        assert!(err.contains("K, M or G"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_empty_size_is_rejected() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("   ").is_err());
+    }
+
+    #[test]
+    fn a_size_that_would_overflow_is_rejected_rather_than_wrapping() {
+        let err = parse_size("99999999999999999999G").unwrap_err();
+        assert!(!err.is_empty());
+
+        let err = parse_size(&format!("{}G", u64::MAX)).unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
     }
 }

@@ -12,6 +12,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 #[cfg(test)]
 use std::time::Duration;
@@ -122,6 +123,118 @@ pub fn classify_age(modified: Option<SystemTime>, now: SystemTime) -> AgeBucket 
     }
 }
 
+/// Size bands, chosen around backup behaviour rather than round numbers.
+///
+/// Per-file overhead dominates backup throughput for small files no matter how
+/// fast the link is, so the interesting detail is all at the bottom of the
+/// range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SizeBand {
+    /// Zero bytes: pure per-file overhead, no payload at all.
+    Empty,
+    Under4K,
+    From4KTo64K,
+    From64KTo1M,
+    From1MTo16M,
+    From16MTo128M,
+    Over128M,
+}
+
+impl SizeBand {
+    /// Every band, smallest first. Declaration order is display order.
+    pub const ALL: [SizeBand; 7] = [
+        SizeBand::Empty,
+        SizeBand::Under4K,
+        SizeBand::From4KTo64K,
+        SizeBand::From64KTo1M,
+        SizeBand::From1MTo16M,
+        SizeBand::From16MTo128M,
+        SizeBand::Over128M,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SizeBand::Empty => "empty",
+            SizeBand::Under4K => "under 4 KB",
+            SizeBand::From4KTo64K => "4 KB to 64 KB",
+            SizeBand::From64KTo1M => "64 KB to 1 MB",
+            SizeBand::From1MTo16M => "1 MB to 16 MB",
+            SizeBand::From16MTo128M => "16 MB to 128 MB",
+            SizeBand::Over128M => "over 128 MB",
+        }
+    }
+}
+
+/// Place a file size into a [`SizeBand`]. Each boundary belongs to the band
+/// above it.
+pub fn classify_size(bytes: u64) -> SizeBand {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+
+    match bytes {
+        0 => SizeBand::Empty,
+        b if b < 4 * KB => SizeBand::Under4K,
+        b if b < 64 * KB => SizeBand::From4KTo64K,
+        b if b < MB => SizeBand::From64KTo1M,
+        b if b < 16 * MB => SizeBand::From1MTo16M,
+        b if b < 128 * MB => SizeBand::From16MTo128M,
+        _ => SizeBand::Over128M,
+    }
+}
+
+/// What one directory holds, used to find small-file concentrations.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryStats {
+    pub files: u64,
+    pub bytes: u64,
+    /// Files at or below the configured small-file threshold.
+    pub small_files: u64,
+    pub small_bytes: u64,
+}
+
+impl DirectoryStats {
+    fn add_file(&mut self, size: u64, small_at_or_below: u64) {
+        self.files += 1;
+        self.bytes += size;
+        if size <= small_at_or_below {
+            self.small_files += 1;
+            self.small_bytes += size;
+        }
+    }
+
+    fn merge(&mut self, other: DirectoryStats) {
+        self.files += other.files;
+        self.bytes += other.bytes;
+        self.small_files += other.small_files;
+        self.small_bytes += other.small_bytes;
+    }
+
+    /// Mean file size in bytes, or zero for an empty directory.
+    pub fn average_bytes(&self) -> f64 {
+        if self.files == 0 {
+            0.0
+        } else {
+            self.bytes as f64 / self.files as f64
+        }
+    }
+
+    /// Proportion of this directory's files that count as small, from 0 to 1.
+    pub fn small_share(&self) -> f64 {
+        if self.files == 0 {
+            0.0
+        } else {
+            self.small_files as f64 / self.files as f64
+        }
+    }
+}
+
+/// A directory holding enough small files to be worth targeting separately.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hotspot {
+    pub directory: PathBuf,
+    pub stats: DirectoryStats,
+}
+
 /// One of the largest files seen during a scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LargestFile {
@@ -156,6 +269,12 @@ pub struct ScanOptions {
     /// How many of the largest files to retain. Zero disables the report and
     /// avoids the per-file path allocation entirely.
     pub top: usize,
+    /// How many small-file directories to report. Zero disables the report and
+    /// avoids tracking per-directory totals at all.
+    pub hotspots: usize,
+    /// A file this size or smaller counts as small. Backup throughput is
+    /// dominated by per-file overhead below roughly this point.
+    pub small_at_or_below: u64,
 }
 
 impl Default for ScanOptions {
@@ -165,6 +284,8 @@ impl Default for ScanOptions {
             threads: num_cpus::get(),
             skip_hidden: false,
             top: 10,
+            hotspots: 10,
+            small_at_or_below: 64 * 1024,
         }
     }
 }
@@ -174,11 +295,52 @@ impl Default for ScanOptions {
 struct Partial {
     extensions: HashMap<String, Bucket>,
     ages: HashMap<AgeBucket, Bucket>,
+    sizes: HashMap<SizeBand, Bucket>,
+    /// Keyed by the directory holding the files, so its size is bounded by the
+    /// number of directories rather than the number of files.
+    directories: HashMap<PathBuf, DirectoryStats>,
+    /// The directory currently being filled. The walk yields files grouped by
+    /// directory and siblings share one `Arc`, so holding the last one turns
+    /// a hash of the full path per file into a pointer comparison.
+    pending: Option<(Arc<Path>, DirectoryStats)>,
+    /// Counted for every file regardless of the hotspot setting, so the
+    /// headline small-file figure is a whole-scan total rather than a sum over
+    /// whichever directories made the report.
+    small_files: u64,
+    small_bytes: u64,
     /// Min-heap, so the smallest retained file is the one evicted.
     largest: BinaryHeap<Reverse<LargestFile>>,
 }
 
 impl Partial {
+    /// Record a file against the directory holding it.
+    fn record_directory(&mut self, parent: &Arc<Path>, size: u64, small_at_or_below: u64) {
+        if let Some((cached, stats)) = &mut self.pending {
+            if Arc::ptr_eq(cached, parent) {
+                stats.add_file(size, small_at_or_below);
+                return;
+            }
+        }
+
+        // A different directory, so bank the previous one and start again.
+        self.flush_pending();
+
+        let mut stats = DirectoryStats::default();
+        stats.add_file(size, small_at_or_below);
+        self.pending = Some((Arc::clone(parent), stats));
+    }
+
+    /// Move the directory being filled into the map. Must be called before
+    /// anything reads `directories`.
+    fn flush_pending(&mut self) {
+        if let Some((path, stats)) = self.pending.take() {
+            self.directories
+                .entry(path.to_path_buf())
+                .or_default()
+                .merge(stats);
+        }
+    }
+
     /// Offer a file to the largest-files heap.
     ///
     /// The path is produced lazily: building it allocates, and the vast
@@ -215,13 +377,24 @@ impl Partial {
         }
     }
 
-    fn merge(&mut self, other: Partial, top: usize) {
+    fn merge(&mut self, mut other: Partial, top: usize) {
+        self.flush_pending();
+        other.flush_pending();
+
         for (extension, bucket) in other.extensions {
             self.extensions.entry(extension).or_default().merge(bucket);
         }
         for (age, bucket) in other.ages {
             self.ages.entry(age).or_default().merge(bucket);
         }
+        for (band, bucket) in other.sizes {
+            self.sizes.entry(band).or_default().merge(bucket);
+        }
+        for (directory, stats) in other.directories {
+            self.directories.entry(directory).or_default().merge(stats);
+        }
+        self.small_files += other.small_files;
+        self.small_bytes += other.small_bytes;
         for Reverse(file) in other.largest {
             self.absorb(file, top);
         }
@@ -246,6 +419,18 @@ pub struct Scan {
     pub totals: HashMap<String, Bucket>,
     /// Totals by file age. Buckets with no files are absent.
     pub ages: HashMap<AgeBucket, Bucket>,
+    /// Totals by file size. Bands with no files are absent.
+    pub sizes: HashMap<SizeBand, Bucket>,
+    /// Directories holding the most small files, worst first, at most
+    /// `ScanOptions::hotspots`. Directories with no small files are excluded.
+    pub hotspots: Vec<Hotspot>,
+    /// The threshold the small-file figures were computed against.
+    pub small_at_or_below: u64,
+    /// Every file at or below the threshold, counted across the whole scan
+    /// rather than only the reported hotspots, and independently of whether
+    /// the hotspot report was enabled.
+    pub small_files: u64,
+    pub small_bytes: u64,
     /// The largest files found, biggest first, at most `ScanOptions::top`.
     pub largest: Vec<LargestFile>,
     /// First [`MAX_REPORTED_ERRORS`] walk failures, for display.
@@ -293,6 +478,24 @@ impl Scan {
             .iter()
             .filter_map(|age| self.ages.get(age).map(|bucket| (*age, *bucket)))
             .collect()
+    }
+
+    /// Size bands smallest first, skipping any that hold no files.
+    pub fn size_rows(&self) -> Vec<(SizeBand, Bucket)> {
+        SizeBand::ALL
+            .iter()
+            .filter_map(|band| self.sizes.get(band).map(|bucket| (*band, *bucket)))
+            .collect()
+    }
+
+    /// Share of all files that are small, from 0 to 1.
+    pub fn small_share(&self) -> f64 {
+        let files = self.total_files();
+        if files == 0 {
+            0.0
+        } else {
+            self.small_files as f64 / files as f64
+        }
     }
 }
 
@@ -393,6 +596,20 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
                 .or_default()
                 .add_file(size);
 
+            acc.sizes
+                .entry(classify_size(size))
+                .or_default()
+                .add_file(size);
+
+            if size <= options.small_at_or_below {
+                acc.small_files += 1;
+                acc.small_bytes += size;
+            }
+
+            if options.hotspots > 0 {
+                acc.record_directory(&entry.parent_path, size, options.small_at_or_below);
+            }
+
             acc.consider(size, options.top, || entry.path());
 
             acc
@@ -402,6 +619,10 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
             acc
         });
 
+    // The last directory of the final chunk is still buffered.
+    let mut aggregated = aggregated;
+    aggregated.flush_pending();
+
     let mut largest: Vec<LargestFile> = aggregated
         .largest
         .into_iter()
@@ -409,9 +630,30 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
         .collect();
     largest.sort_by(|a, b| b.cmp(a));
 
+    // Most small files first. A directory holding none is not a hotspot, so it
+    // is dropped rather than padding the list.
+    let mut hotspots: Vec<Hotspot> = aggregated
+        .directories
+        .into_iter()
+        .filter(|(_, stats)| stats.small_files > 0)
+        .map(|(directory, stats)| Hotspot { directory, stats })
+        .collect();
+    hotspots.sort_by(|a, b| {
+        b.stats
+            .small_files
+            .cmp(&a.stats.small_files)
+            .then_with(|| a.directory.cmp(&b.directory))
+    });
+    hotspots.truncate(options.hotspots);
+
     Ok(Scan {
         totals: aggregated.extensions,
         ages: aggregated.ages,
+        sizes: aggregated.sizes,
+        hotspots,
+        small_at_or_below: options.small_at_or_below,
+        small_files: aggregated.small_files,
+        small_bytes: aggregated.small_bytes,
         largest,
         walk_errors,
         walk_error_count,
@@ -648,6 +890,110 @@ mod tests {
         for age in AgeBucket::ALL {
             assert!(!age.label().is_empty());
         }
+    }
+
+    #[test]
+    fn sizes_land_in_the_expected_band() {
+        assert_eq!(classify_size(0), SizeBand::Empty);
+        assert_eq!(classify_size(1), SizeBand::Under4K);
+        assert_eq!(classify_size(10_000), SizeBand::From4KTo64K);
+        assert_eq!(classify_size(500_000), SizeBand::From64KTo1M);
+        assert_eq!(classify_size(5 * 1024 * 1024), SizeBand::From1MTo16M);
+        assert_eq!(classify_size(64 * 1024 * 1024), SizeBand::From16MTo128M);
+        assert_eq!(classify_size(500 * 1024 * 1024), SizeBand::Over128M);
+    }
+
+    #[test]
+    fn size_band_boundaries_do_not_overlap_or_leave_gaps() {
+        const KB: u64 = 1024;
+        const MB: u64 = 1024 * KB;
+
+        // Each boundary belongs to the band above it.
+        assert_eq!(classify_size(4 * KB - 1), SizeBand::Under4K);
+        assert_eq!(classify_size(4 * KB), SizeBand::From4KTo64K);
+
+        assert_eq!(classify_size(64 * KB - 1), SizeBand::From4KTo64K);
+        assert_eq!(classify_size(64 * KB), SizeBand::From64KTo1M);
+
+        assert_eq!(classify_size(MB - 1), SizeBand::From64KTo1M);
+        assert_eq!(classify_size(MB), SizeBand::From1MTo16M);
+
+        assert_eq!(classify_size(16 * MB - 1), SizeBand::From1MTo16M);
+        assert_eq!(classify_size(16 * MB), SizeBand::From16MTo128M);
+
+        assert_eq!(classify_size(128 * MB - 1), SizeBand::From16MTo128M);
+        assert_eq!(classify_size(128 * MB), SizeBand::Over128M);
+    }
+
+    #[test]
+    fn an_empty_file_is_its_own_band_rather_than_merely_small() {
+        // Zero-byte files are pure per-file backup overhead with no payload,
+        // so lumping them in with "under 4 KB" would hide them.
+        assert_eq!(classify_size(0), SizeBand::Empty);
+        assert_ne!(classify_size(1), SizeBand::Empty);
+    }
+
+    #[test]
+    fn every_size_band_has_a_label() {
+        for band in SizeBand::ALL {
+            assert!(!band.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn size_rows_come_back_smallest_first_and_skip_empty_bands() {
+        let mut scan = Scan::default();
+        scan.sizes
+            .insert(SizeBand::Over128M, Bucket { count: 1, bytes: 1 });
+        scan.sizes
+            .insert(SizeBand::Under4K, Bucket { count: 2, bytes: 2 });
+
+        let order: Vec<SizeBand> = scan.size_rows().iter().map(|(band, _)| *band).collect();
+
+        assert_eq!(order, [SizeBand::Under4K, SizeBand::Over128M]);
+    }
+
+    #[test]
+    fn a_directory_counts_files_at_the_threshold_as_small() {
+        let mut stats = DirectoryStats::default();
+
+        stats.add_file(64, 64);
+        stats.add_file(65, 64);
+        stats.add_file(1, 64);
+
+        assert_eq!(stats.files, 3);
+        assert_eq!(stats.bytes, 130);
+        assert_eq!(stats.small_files, 2);
+        assert_eq!(stats.small_bytes, 65);
+    }
+
+    #[test]
+    fn directory_shares_and_averages_guard_the_empty_case() {
+        let empty = DirectoryStats::default();
+
+        assert_eq!(empty.small_share(), 0.0);
+        assert_eq!(empty.average_bytes(), 0.0);
+        assert!(empty.small_share().is_finite());
+        assert!(empty.average_bytes().is_finite());
+    }
+
+    #[test]
+    fn directory_small_share_is_a_proportion_of_its_own_files() {
+        let mut stats = DirectoryStats::default();
+        for _ in 0..3 {
+            stats.add_file(10, 64);
+        }
+        stats.add_file(1000, 64);
+
+        assert_eq!(stats.small_share(), 0.75);
+    }
+
+    #[test]
+    fn scan_small_share_guards_the_empty_case() {
+        let scan = Scan::default();
+
+        assert_eq!(scan.small_share(), 0.0);
+        assert!(scan.small_share().is_finite());
     }
 
     fn file(path: &str, bytes: u64) -> LargestFile {

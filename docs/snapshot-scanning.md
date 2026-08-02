@@ -192,6 +192,35 @@ difference will include your own change of method rather than real growth: use
 the same `--skip-hidden` setting for both, and scan an equivalent path in each
 snapshot rather than the live tree in one and a snapshot in the other.
 
+## Planning a backup window
+
+Backup time is not proportional to capacity. Per-file overhead dominates for
+small files, so a 2 TB share of small files can take far longer to protect than
+a 20 TB share of large ones. The size band table shows the split directly, and
+the line beneath it gives the headline figure:
+
+```
+65495 files (96.1% of the total) are 64.0 KB or smaller, holding 388.9 MB between them
+```
+
+When that share is high, the hotspot report names the directories responsible so
+they can be given their own backup job, excluded, or archived rather than being
+rescanned nightly along with everything else. Because files count towards the
+directory that actually holds them, the listed paths can be used as-is.
+
+Set the threshold to match the software doing the backup, since where per-file
+overhead starts to dominate varies:
+
+```sh
+fast-walk -p /mnt/snapshot/.snapshot/nightly.0 --small-under 128K --hotspots 25
+```
+
+This is the one report that is not free. It keeps a running total per directory,
+so memory grows with the number of directories rather than the number of files,
+and it measured about 18% of scan time on a 68,000 file tree. On a very large
+share, scan once with `--hotspots 0` to get the size bands cheaply, then rerun
+with hotspots enabled against the specific subtree the bands implicate.
+
 ## Finding what is actually consuming the space
 
 The per-extension totals say `.mp4` is the problem; the largest-files report

@@ -31,6 +31,8 @@ Run app in terminal.
         -t, --threads <THREADS>        [default: 8]
             --skip-hidden              Skip hidden files and directories
             --top <TOP>                Largest files to report, 0 disables [default: 10]
+            --hotspots <HOTSPOTS>      Small-file directories to report, 0 disables [default: 10]
+            --small-under <SIZE>       What counts as a small file [default: 64K]
             --diff <OLD> <NEW>         Compare two results CSVs instead of scanning
 
 Example running on the same directory as the application, max depth 5, threads 4
@@ -77,6 +79,8 @@ A scan writes three CSVs, sharing one name stem:
 | --- | --- |
 | `results-XXXXXX.csv` | totals per extension |
 | `results-XXXXXX-age.csv` | totals per age band |
+| `results-XXXXXX-size.csv` | totals per size band |
+| `results-XXXXXX-hotspots.csv` | directories holding the most small files |
 | `results-XXXXXX-largest.csv` | the largest files found |
 
 ### By age
@@ -94,6 +98,60 @@ the scan started are reported as `modified in future` rather than being counted
 as new; this normally means the clocks on the scanning host and the file server
 disagree. Files whose modification time the filesystem does not report land in
 `unknown`.
+
+### By file size
+
+Files are also grouped into size bands, with each band's share of both the file
+count and the capacity. Backup throughput is governed by per-file overhead as
+much as by bytes, so a share that is mostly small files takes far longer to back
+up than its size suggests. The two columns together are what show it:
+
+    ╭─────────────────┬──────────┬────────────┬─────────────┬──────────╮
+    │ Size            │ Quantity │ % of Files │ Capacity MB │ % of Cap │
+    ╞═════════════════╪══════════╪════════════╪═════════════╪══════════╡
+    │ empty           │ 117      │ 0.2%       │ 0.00        │ 0.0%     │
+    │ under 4 KB      │ 43424    │ 63.7%      │ 51.26       │ 1.5%     │
+    │ 4 KB to 64 KB   │ 21954    │ 32.2%      │ 337.64      │ 9.9%     │
+    │ 64 KB to 1 MB   │ 2324     │ 3.4%       │ 450.37      │ 13.2%    │
+    │ 1 MB to 16 MB   │ 286      │ 0.4%       │ 1055.03     │ 31.0%    │
+    │ 16 MB to 128 MB │ 27       │ 0.0%       │ 1242.89     │ 36.5%    │
+    │ over 128 MB     │ 2        │ 0.0%       │ 271.14      │ 8.0%     │
+    ╰─────────────────┴──────────┴────────────┴─────────────┴──────────╯
+
+Here 96% of the files hold 11% of the data. The bands are deliberately fine at
+the bottom of the range and coarse at the top, because that is where the
+difference in backup time lives. Empty files get their own band since they are
+pure per-file overhead with no payload at all.
+
+### Small-file hotspots
+
+Knowing a share is full of small files does not tell you what to do about it.
+The hotspot report names the directories holding them, so those paths can be
+split into their own backup job, excluded, or archived:
+
+    Directories holding the most files of 64.0 KB or smaller
+    ╭────────────────────────────────────────────────┬───────┬───────┬─────────┬─────────────┬──────────╮
+    │ Directory                                      │ Files │ Small │ % Small │ Capacity MB │ Avg Size │
+    ╞════════════════════════════════════════════════╪═══════╪═══════╪═════════╪═════════════╪══════════╡
+    │ /usr/local/go1.25.1/test/fixedbugs             │ 1818  │ 1816  │ 99.9%   │ 5.01        │ 2.8 KB   │
+    │ /usr/local/go1.25.1/src/cmd/go/testdata/script │ 892   │ 892   │ 100.0%  │ 1.24        │ 1.4 KB   │
+    │ /usr/share/icons/ubuntu-mono-light/status/22   │ 810   │ 810   │ 100.0%  │ 0.74        │ 952 B    │
+    ╰────────────────────────────────────────────────┴───────┴───────┴─────────┴─────────────┴──────────╯
+
+Files count towards the directory that holds them, not towards its parents, so
+a listed path is one you can act on directly rather than a rolled-up total.
+Directories holding no small files are left out.
+
+`--small-under` sets the threshold, accepting a byte count or a `K`, `M` or `G`
+suffix; the default of `64K` is around where per-file overhead starts to
+dominate for most backup software. `--hotspots N` changes how many directories
+are listed and `--hotspots 0` turns the report off.
+
+Unlike the other reports, this one is not free: it keeps a running total per
+directory, which costs memory proportional to the number of directories and
+measured about 18% of scan time on a 68,000 file tree. The headline small-file
+count below the size table is a whole-scan total and stays accurate even with
+`--hotspots 0`.
 
 ### Largest files
 

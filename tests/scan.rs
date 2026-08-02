@@ -1,6 +1,6 @@
 //! End-to-end tests for [`fast_walk::scan`] against real directory trees.
 
-use fast_walk::{scan, AgeBucket, Bucket, NoProgress, Scan, ScanOptions, NO_EXTENSION};
+use fast_walk::{scan, AgeBucket, Bucket, NoProgress, Scan, ScanOptions, SizeBand, NO_EXTENSION};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -333,6 +333,168 @@ fn equally_sized_files_produce_the_same_list_on_every_run() {
         let again = scan_dir_with(dir.path(), options());
         assert_eq!(first.largest, again.largest);
     }
+}
+
+#[test]
+fn files_are_bucketed_by_size() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "empty.bin", 0);
+    write_file(dir.path(), "tiny.bin", 100);
+    write_file(dir.path(), "small.bin", 10_000);
+    write_file(dir.path(), "medium.bin", 500_000);
+
+    let scan = scan_dir(dir.path());
+
+    assert_eq!(scan.sizes[&SizeBand::Empty].count, 1);
+    assert_eq!(scan.sizes[&SizeBand::Under4K].count, 1);
+    assert_eq!(scan.sizes[&SizeBand::From4KTo64K].count, 1);
+    assert_eq!(scan.sizes[&SizeBand::From64KTo1M].count, 1);
+}
+
+#[test]
+fn the_size_bands_account_for_every_file_exactly_once() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "a.bin", 0);
+    write_file(dir.path(), "b.bin", 100);
+    write_file(dir.path(), "nested/c.bin", 200_000);
+
+    let scan = scan_dir(dir.path());
+
+    let banded_files: u64 = scan.sizes.values().map(|bucket| bucket.count).sum();
+    let banded_bytes: u64 = scan.sizes.values().map(|bucket| bucket.bytes).sum();
+
+    assert_eq!(banded_files, scan.total_files());
+    assert_eq!(banded_bytes, scan.total_bytes());
+}
+
+#[test]
+fn the_directory_with_the_most_small_files_is_reported_first() {
+    // The backup case: one directory of many tiny files is far more expensive
+    // to back up than another holding the same bytes in one file.
+    let dir = TempDir::new().unwrap();
+    for i in 0..50 {
+        write_file(dir.path(), &format!("many_small/f{i}.bin"), 10);
+    }
+    for i in 0..5 {
+        write_file(dir.path(), &format!("few_small/f{i}.bin"), 10);
+    }
+    write_file(dir.path(), "one_big/blob.bin", 5_000_000);
+
+    let scan = scan_dir(dir.path());
+
+    assert_eq!(scan.hotspots[0].directory, dir.path().join("many_small"));
+    assert_eq!(scan.hotspots[0].stats.small_files, 50);
+    assert_eq!(scan.hotspots[1].directory, dir.path().join("few_small"));
+    assert_eq!(scan.hotspots[1].stats.small_files, 5);
+}
+
+#[test]
+fn directories_holding_no_small_files_are_not_hotspots() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "big/blob.bin", 5_000_000);
+    write_file(dir.path(), "small/f.bin", 10);
+
+    let scan = scan_dir(dir.path());
+
+    let listed: Vec<&Path> = scan
+        .hotspots
+        .iter()
+        .map(|hotspot| hotspot.directory.as_path())
+        .collect();
+
+    assert_eq!(listed, [dir.path().join("small").as_path()]);
+}
+
+#[test]
+fn the_small_file_threshold_is_configurable() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "data/a.bin", 5_000);
+    write_file(dir.path(), "data/b.bin", 50_000);
+
+    let strict = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            small_at_or_below: 10_000,
+            ..ScanOptions::default()
+        },
+    );
+    assert_eq!(strict.small_files, 1);
+
+    let loose = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            small_at_or_below: 100_000,
+            ..ScanOptions::default()
+        },
+    );
+    assert_eq!(loose.small_files, 2);
+}
+
+#[test]
+fn hotspots_are_capped_but_the_small_file_total_is_not() {
+    // The headline figure must cover the whole scan, not just the directories
+    // that made the list.
+    let dir = TempDir::new().unwrap();
+    for directory in 0..5 {
+        for file in 0..4 {
+            write_file(dir.path(), &format!("d{directory}/f{file}.bin"), 10);
+        }
+    }
+
+    let scan = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            hotspots: 2,
+            ..ScanOptions::default()
+        },
+    );
+
+    assert_eq!(scan.hotspots.len(), 2);
+    assert_eq!(scan.small_files, 20);
+    assert_eq!(scan.small_bytes, 200);
+}
+
+#[test]
+fn turning_hotspots_off_still_reports_the_small_file_total() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "data/a.bin", 10);
+    write_file(dir.path(), "data/b.bin", 20);
+
+    let scan = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            hotspots: 0,
+            ..ScanOptions::default()
+        },
+    );
+
+    assert!(scan.hotspots.is_empty());
+    assert_eq!(scan.small_files, 2);
+    assert_eq!(scan.small_bytes, 30);
+    assert_eq!(scan.small_share(), 1.0);
+}
+
+#[test]
+fn hotspots_are_attributed_to_the_directory_holding_the_files() {
+    // Files must count towards their own directory, not an ancestor.
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "top.bin", 10);
+    write_file(dir.path(), "a/b/deep.bin", 10);
+
+    let scan = scan_dir(dir.path());
+
+    let mut listed: Vec<&Path> = scan
+        .hotspots
+        .iter()
+        .map(|hotspot| hotspot.directory.as_path())
+        .collect();
+    listed.sort();
+
+    let nested = dir.path().join("a/b");
+    let mut expected = vec![dir.path(), nested.as_path()];
+    expected.sort();
+
+    assert_eq!(listed, expected);
 }
 
 #[cfg(unix)]

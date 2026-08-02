@@ -118,9 +118,14 @@ fn scan_to_csv(tree: &Path, working: &Path) -> PathBuf {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
+            // The extensions CSV is `results-<stem>.csv`; every other report
+            // adds a suffix after the stem. Matching that shape rather than
+            // excluding known suffixes keeps this working as reports are added.
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            name.starts_with("results-") && name.ends_with(".csv") && !name.contains("-age")
-                && !name.contains("-largest")
+            match name.strip_prefix("results-").and_then(|rest| rest.strip_suffix(".csv")) {
+                Some(stem) => !stem.contains('-'),
+                None => false,
+            }
         })
         .collect();
 
