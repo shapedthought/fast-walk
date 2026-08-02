@@ -37,6 +37,15 @@ impl Bucket {
         self.count += other.count;
         self.bytes += other.bytes;
     }
+
+    /// Mean file size in bytes, or zero for an empty bucket.
+    pub fn average_bytes(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.bytes as f64 / self.count as f64
+        }
+    }
 }
 
 /// How the walk should be performed.
@@ -101,6 +110,16 @@ impl Scan {
 
     pub fn total_bytes(&self) -> u64 {
         self.totals.values().map(|bucket| bucket.bytes).sum()
+    }
+
+    /// Mean size across every file measured, or zero if nothing was measured.
+    pub fn average_bytes(&self) -> f64 {
+        let count = self.total_files();
+        if count == 0 {
+            0.0
+        } else {
+            self.total_bytes() as f64 / count as f64
+        }
     }
 }
 
@@ -313,5 +332,38 @@ mod tests {
 
         assert_eq!(scan.total_files(), 10);
         assert_eq!(scan.total_bytes(), 120);
+    }
+
+    #[test]
+    fn average_size_divides_bytes_by_file_count() {
+        let bucket = Bucket {
+            count: 4,
+            bytes: 10,
+        };
+
+        assert_eq!(bucket.average_bytes(), 2.5);
+    }
+
+    #[test]
+    fn average_size_of_an_empty_bucket_is_zero_not_a_division_by_zero() {
+        assert_eq!(Bucket::default().average_bytes(), 0.0);
+        assert!(Bucket::default().average_bytes().is_finite());
+    }
+
+    #[test]
+    fn overall_average_is_taken_across_all_extensions_not_per_extension() {
+        // Averaging the two per-extension averages would give 55; the mean
+        // file is much smaller than that because most files are the small ones.
+        let scan = scan_with(&[("txt", 1, 100), ("rs", 9, 90)]);
+
+        assert_eq!(scan.average_bytes(), 19.0);
+    }
+
+    #[test]
+    fn overall_average_of_an_empty_scan_is_zero() {
+        let scan = Scan::default();
+
+        assert_eq!(scan.average_bytes(), 0.0);
+        assert!(scan.average_bytes().is_finite());
     }
 }
