@@ -830,7 +830,14 @@ fn file_names_that_are_not_utf8_do_not_panic() {
     // Regression: unwrapping `to_str()` aborted the whole scan on such names.
     let dir = TempDir::new().unwrap();
     let name = OsStr::from_bytes(b"bad\xff\xfename.txt");
-    fs::write(dir.path().join(name), vec![b'x'; 6]).unwrap();
+
+    // APFS rejects a name that is not valid UTF-8, so on macOS the fixture
+    // cannot be built and there is nothing to scan. The bug is still reachable
+    // on the filesystems that do allow such names, which is where this runs.
+    if fs::write(dir.path().join(name), vec![b'x'; 6]).is_err() {
+        eprintln!("skipped: this filesystem will not create a name that is not UTF-8");
+        return;
+    }
 
     let scan = scan_dir(dir.path());
 

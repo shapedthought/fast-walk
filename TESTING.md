@@ -19,7 +19,7 @@ still hold.
 | --- | --- | --- | --- | --- | --- |
 | Local scan | Linux, ext4 | — | Verified | 0.2.0 | 2026-08-02 |
 | Local scan | Windows Server, NTFS | — | Verified | 0.2.0 | 2026-08-02 |
-| Local scan | macOS, APFS | — | **Not tried** | | |
+| Local scan | macOS, APFS | — | Verified, standard fixture exact on both totals and on every documented expectation | 0.2.0 | 2026-08-02 |
 | SMB | Linux, cifs | Windows Server | Verified, byte identical to a local scan of the same tree | 0.2.0 | 2026-08-02 |
 | SMB | macOS, smbfs | any | **Not tried** | | |
 | SMB | Windows | Windows Server | **Not tried** | | |
@@ -41,6 +41,14 @@ be added. Nothing about it is expected to differ over SMB — it is fed from the
 same directory listings as everything else — but that is reasoning, not a
 result, and the row above should not be read as covering it.
 
+The macOS row covers a local APFS scan only, and it is narrower than it looks
+in one respect: **APFS refuses to create a file name that is not valid UTF-8**,
+so the class of name that once aborted an entire scan cannot exist there. The
+integration test for it skips itself on macOS and says so, which means that
+particular regression is only really guarded on ext4 and NTFS. APFS is also
+case-insensitive by default, and the `JPG` and `jpg` files still came back as
+two separate extensions because the fixture keeps them in separate directories.
+
 Findings from those runs that changed the tool or the documentation are written
 up in [docs/snapshot-scanning.md](docs/snapshot-scanning.md).
 
@@ -51,9 +59,10 @@ Roughly in order of how much they would tell us:
 1. **A NetApp or ZFS NFS export.** The NFS guidance is written for these and has
    never met one. The `.snapshot` and `.zfs` traversal warnings in particular
    are reasoning, not observation.
-2. **Anything from macOS.** No result at all so far, local or over SMB. macOS
-   also writes its own metadata onto shares it browses, which is worth knowing
-   the shape of.
+2. **macOS over SMB.** The local APFS scan is now done and came out exact, so
+   what is left is the transport: macOS writes its own metadata onto shares it
+   browses, and `._` resource forks and `.DS_Store` would land in the totals as
+   ordinary files. Nobody has looked at how much that moves a result by.
 3. **A tree with millions of files.** The scan lists everything before measuring
    any of it, so memory grows with file count and attribute caches can expire
    between the two phases. Neither effect has been seen on anything larger than

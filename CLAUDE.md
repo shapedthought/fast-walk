@@ -29,11 +29,15 @@ but silently drops doc tests.
 `test_scan_error`. Where a test guards against a specific past bug, a comment
 starting `Regression:` says what the bug was.
 
-**Permission tests skip themselves under root.** Root bypasses permission bits,
-so a `chmod 000` fixture denies nothing and the assertions pass vacuously. The
-tests check `fs::read_dir(...).is_err()` first and print a skip notice
-otherwise. When touching these, verify them as an unprivileged user or you are
-not testing anything.
+**A test whose fixture the platform may refuse skips itself and says so.** Two
+cases exist. Permission tests: root bypasses permission bits, so a `chmod 000`
+fixture denies nothing and the assertions pass vacuously; they check
+`fs::read_dir(...).is_err()` first. The non-UTF-8 name test: APFS will not
+create the name at all, so on macOS there is no fixture to scan; it checks
+whether the write succeeded. Both print a skip notice on the path they did not
+take, so a run that proves nothing does not read as a pass. When touching
+either, verify it on a platform that does build the fixture — as an
+unprivileged user, or on ext4 — or you are not testing anything.
 
 **Truncated output says what it left out.** Tables capped at N rows print how
 many rows exist and where the full set is. A view that silently truncates reads
