@@ -183,16 +183,38 @@ as an authentication failure. If the mount fails, `sudo dmesg | tail` carries
 the real reason: `-2` is a share name that does not exist, `-13` is
 authentication.
 
-Recent kernels accept a `snapshot=` mount option to mount a specific shadow
-copy directly. Where that is unavailable, address the `@GMT` path itself. The
-token has to be given exactly — shadow copies generally do not appear in a
-normal directory listing of the parent, so you cannot discover them by browsing:
+Reaching a specific shadow copy works differently on the two clients.
+
+From Linux, use the `snapshot=` mount option. Addressing an `@GMT` path under
+an ordinary mount does not work: path level `@GMT` traversal is a feature of
+the Windows SMB client, and `snapshot=` is what the Linux client provides
+instead.
 
 ```sh
-fast-walk -p '/mnt/snapshot/@GMT-2026.08.01-02.00.00' -t 4 -o ~/scans/nightly
+sudo mount -t cifs //fileserver/data /mnt/snapshot \
+    -o ro,vers=3.0,credentials=/root/.smbcred,snapshot=@GMT-2026.08.01-02.00.00
+fast-walk -p /mnt/snapshot -o ~/scans/nightly
 ```
 
-Or from Windows, against the share directly:
+The token has to be exact, and it is in **UTC** while `vssadmin list shadows`
+prints local time. Converting by hand invites an off by one timezone; ask the
+server for it already converted:
+
+```powershell
+Get-CimInstance Win32_ShadowCopy | ForEach-Object {
+    '@GMT-{0:yyyy.MM.dd-HH.mm.ss}' -f $_.InstallDate.ToUniversalTime()
+}
+```
+
+A token that does not match a shadow copy fails the mount with `-2` in
+`dmesg`, which reads like a missing share and is easy to misdiagnose. A `-22`
+there would mean the option itself was rejected, so the two are worth telling
+apart.
+
+Shadow copies do not appear in a normal directory listing of the parent, so
+there is no browsing your way to the name.
+
+From Windows, address the `@GMT` path directly against the share:
 
 ```powershell
 fast-walk.exe -p "\\fileserver\data\@GMT-2026.08.01-02.00.00" -t 4 -o $HOME\scans\nightly
@@ -316,7 +338,10 @@ Verified against a Windows Server share mounted over SMB from Linux:
 Not verified, and written from documentation rather than practice:
 
 - Everything in the NFS section
-- The `snapshot=` mount option
+- Whether `snapshot=` actually mounts a shadow copy. The option is accepted:
+  passing an `@GMT` token that matched no shadow copy failed with `-2` rather
+  than being rejected as malformed, so the form is right. Reaching a real
+  shadow copy through it was not achieved.
 - Any of it over a high latency link
 
 ## A difference worth knowing about on Windows
