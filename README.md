@@ -119,9 +119,34 @@ container, not at where it lives on the host:
     docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
         -v "$PWD":/out -v "$PWD/.smbcred":/creds:ro \
         --entrypoint bash fast-walk -c '
+            set -euo pipefail
             mkdir -p /scan
             mount -t cifs //fileserver/data /scan -o ro,vers=3.0,credentials=/creds
             fast-walk -p /scan'
+
+**Keep the `set -euo pipefail`.** Without it a failed mount does not stop the
+script, so `fast-walk` scans the empty directory that was going to be the
+mountpoint, reports zero files and exits successfully. To anything reading the
+exit status that is indistinguishable from an empty share, which is the exact
+confusion this tool exists to prevent. With it, the run stops at the mount and
+exits non-zero.
+
+Two things produce a confusing `mount error(13): Permission denied` before you
+have even reached a real authentication problem:
+
+- **The credentials file does not exist on the host.** Docker creates a
+  *directory* at a bind-mount source that is missing, rather than failing, so
+  `credentials=` is handed a directory, `mount.cifs` falls back to prompting
+  for a password, and a container with no terminal answers with nothing. Check
+  with `ls -ld .smbcred` on the host: if it is a directory, delete it and write
+  the file. `docker run --rm -v "$PWD/.smbcred":/creds:ro --entrypoint bash
+  fast-walk -c 'cat /creds'` should print your two lines.
+- **Stray whitespace or CRLF line endings.** `mount.cifs` takes the value
+  literally, so a trailing space or a `\r` becomes part of the password.
+
+On a Linux host `sudo dmesg | tail` then gives the real reason for anything
+that is left: `Send error in SessSetup = -13` is genuinely the credentials or
+the domain.
 
 If the mount fails, the number in the message is the errno and is usually
 enough on its own: `mount error(13): Permission denied` is authentication, and
@@ -138,6 +163,7 @@ forever:
     docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
         -v "$PWD":/out \
         --entrypoint bash fast-walk -c '
+            set -euo pipefail
             mkdir -p /scan
             mount -t nfs -o ro,soft,timeo=100,retrans=3 nas.example.com:/vol/data /scan
             fast-walk -p /scan'
