@@ -14,6 +14,54 @@ cargo:
 
 The file will be in the target/release folder.
 
+## Building with Docker
+
+If you would rather not install a toolchain, the `Dockerfile` builds it for
+you:
+
+    docker build -t fast-walk .
+
+Scanning needs two mounts: the tree to look at, and somewhere for the results
+to land. The scan target can be read-only, since nothing is ever written to it:
+
+    docker run --rm -v /srv/share:/scan:ro -v "$PWD":/out fast-walk -p /scan
+
+Every option works as it does outside a container, so `-p /scan --skip-hidden
+-o monday` behaves the same way. The results go to the working directory, which
+is why `/out` is mounted; without it the CSVs are written inside the container
+and disappear with it.
+
+If the binary is what you actually want, take it and drop the image. It is a
+normal dynamically linked glibc binary, so it runs on any comparable Linux, not
+only inside a container:
+
+    docker create --name fw fast-walk
+    docker cp fw:/usr/local/bin/fast-walk .
+    docker rm fw
+
+**A container runs as root by default, and root bypasses permission bits.** For
+this tool that is not a detail: a scan as root reports files that the account
+running your backup may not be able to read, so the totals can come out higher
+than what will actually be protected. Pass `--user` to scan as yourself, which
+also leaves the results files owned by you rather than by root:
+
+    docker run --rm --user "$(id -u):$(id -g)" \
+        -v /srv/share:/scan:ro -v "$PWD":/out fast-walk -p /scan
+
+Dependencies are built in their own layer, so editing the source and rebuilding
+does not recompile them: a cold build took 22.6 seconds here and a rebuild
+after a source change took 2.7, with only `fast-walk` itself recompiling. The
+Rust version is pinned in the `Dockerfile` rather than tracking `latest`, so it
+needs bumping deliberately.
+
+What has been checked, on Docker 29.6 with Docker Desktop on macOS and an
+arm64 image: the container scans the standard fixture to 20,232 files and
+1,435,762,672 bytes, matching the documented totals exactly; all six CSVs land
+in the mounted directory; `--cpus=2` is picked up correctly, so the thread
+default respects a container CPU limit rather than seeing the whole host; and a
+`--user` run produces the same totals with the output owned by the caller. The
+image has not been built or run on a Linux host, nor on amd64.
+
 ## How to use
 
 Run app in terminal.

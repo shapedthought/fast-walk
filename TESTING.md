@@ -20,6 +20,7 @@ still hold.
 | Local scan | Linux, ext4 | — | Verified | 0.2.0 | 2026-08-02 |
 | Local scan | Windows Server, NTFS | — | Verified | 0.2.0 | 2026-08-02 |
 | Local scan | macOS, APFS | — | Verified, standard fixture exact on both totals and on every documented expectation | 0.2.0 | 2026-08-02 |
+| Container scan, bind mount | Docker 29.6, Desktop on macOS, arm64 | — | Verified, standard fixture exact; not tried on a Linux host or on amd64 | 0.2.0 | 2026-08-02 |
 | SMB | Linux, cifs | Windows Server | Verified, byte identical to a local scan of the same tree | 0.2.0 | 2026-08-02 |
 | SMB | macOS, smbfs | any | **Not tried** | | |
 | SMB | Windows | Windows Server | **Not tried** | | |
