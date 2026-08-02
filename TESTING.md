@@ -23,6 +23,7 @@ still hold.
 | Container scan, bind mount | Docker 29.6, Desktop on macOS, arm64 | — | Verified, standard fixture exact; not tried on a Linux host or on amd64 | 0.2.0 | 2026-08-02 |
 | SMB | Linux, cifs | Windows Server | Verified, byte identical to a local scan of the same tree | 0.2.0 | 2026-08-02 |
 | SMB | Container, cifs-utils | Samba 4.17 in a container | Verified, byte identical to a local scan across all six reports. Samba, not a NAS | 0.2.0 | 2026-08-02 |
+| SMB | Container on a Linux host with AppArmor | SMB share on the LAN | Verified after adding `--security-opt apparmor=unconfined`; without it `docker-default` denies the mount and it reads as an authentication failure | 0.2.0 | 2026-08-02 |
 | SMB | macOS, smbfs | any | **Not tried** | | |
 | SMB | Windows | Windows Server | **Not tried** | | |
 | SMB shadow copy, `snapshot=` mount option | Linux, cifs | Windows Server | Partial: the option is accepted and the `@GMT` form is right, but no shadow copy was successfully reached | 0.2.0 | 2026-08-02 |
@@ -45,13 +46,23 @@ scanned locally, over SMB from a Samba server and over NFSv4.2 from a Linux
 `nfsd`, all three from inside the image built by the `Dockerfile`, produced
 byte identical CSVs for every report and the exact standard fixture totals.
 
-Read those two rows for what they are. They say the client side works — that
+Read those rows for what they are. They say the client side works — that
 `cifs-utils` and `nfs-common` in the image mount and read correctly, and that
 nothing in the reports is sensitive to the protocol. They say nothing about a
 NAS. Samba is not NetApp, a containerised `nfsd` is not a ZFS appliance, and
 the NFS row is NFSv4.2 only, so the NFSv3 path remains untested by anything
 except the inconclusive Windows Server for NFS run above. Snapshot directory
 traversal was not exercised by either.
+
+The AppArmor row is there because the first two container rows were obtained
+under Docker Desktop, whose LinuxKit kernel has no AppArmor module at all, so
+that testing was structurally incapable of finding the problem. On a Debian or
+Ubuntu host the `docker-default` profile denies `mount` no matter what
+capabilities the container holds, and because the denial lands at the system
+call the CIFS code never runs and never logs, leaving a bare `mount error(13)`
+that looks exactly like a bad password. It cost a real user a debugging session
+before the cause was found. Anything else verified only under Docker Desktop
+should be read with that in mind. SELinux hosts remain untried.
 
 The macOS row covers a local APFS scan only, and it is narrower than it looks
 in one respect: **APFS refuses to create a file name that is not valid UTF-8**,

@@ -358,8 +358,11 @@ TESTING.md for how.
 If you do not have the mount helpers on the machine you are scanning from, the
 container image ships both. It needs `--cap-add SYS_ADMIN --cap-add
 DAC_READ_SEARCH` to mount anything; the second is what `mount.cifs` wants
-before it will apply its capability set. The mount commands themselves are the
-ones above, unchanged.
+before it will apply its capability set. On a Debian or Ubuntu host it also
+needs `--security-opt apparmor=unconfined`, because Docker's `docker-default`
+profile denies `mount` whatever capabilities are held, and the denial arrives
+as a bare `mount error(13)` with nothing in `dmesg` from CIFS at all. The mount
+commands themselves are the ones above, unchanged.
 
 ## A difference worth knowing about on Windows
 

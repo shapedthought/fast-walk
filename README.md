@@ -79,9 +79,26 @@ been tried here.
 `CAP_SYS_ADMIN` is for `mount` itself. `CAP_DAC_READ_SEARCH` is for
 `mount.cifs`, which is setuid and gives up with `Unable to apply new capability
 set` without it — `SYS_ADMIN` on its own is not enough, and adding `SETPCAP`
-instead does not help. Those two together are enough; `--privileged` is not
-required, which is worth keeping that way given what these containers get
-pointed at.
+instead does not help. `--privileged` is not required, which is worth keeping
+that way given what these containers get pointed at.
+
+**On a Debian or Ubuntu host you also need `--security-opt
+apparmor=unconfined`.** Docker applies its `docker-default` AppArmor profile
+there, and that profile denies `mount` regardless of what capabilities the
+container holds. The denial happens at the system call, so the kernel's CIFS
+code never runs and never logs anything, and all you get is a bare `mount
+error(13): Permission denied` — which looks exactly like a rejected password
+and sends you to check your credentials, where there is nothing wrong. If you
+see error 13 and `sudo dmesg` shows no `CIFS: VFS:` lines at all, this is why;
+`sudo dmesg | grep -i apparmor` should show `apparmor="DENIED"
+operation="mount"`.
+
+The flag is in the examples below unconditionally because it is accepted and
+does nothing on hosts with no AppArmor, such as Docker Desktop. Be aware that
+it drops the whole profile for that container rather than just the mount rule.
+A tighter option is a custom profile permitting `mount fstype=cifs` and nothing
+else, which is more work and has not been tried here. Hosts running SELinux
+instead have not been tried either, and may well need their own equivalent.
 
 To check what a container actually ended up with rather than what you meant to
 ask for, run `grep CapEff /proc/self/status` inside it. On Docker 29.6 the
@@ -117,6 +134,7 @@ Then mount with `credentials=` pointing at where the file is mounted in the
 container, not at where it lives on the host:
 
     docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
+        --security-opt apparmor=unconfined \
         -v "$PWD":/out -v "$PWD/.smbcred":/creds:ro \
         --entrypoint bash fast-walk -c '
             set -euo pipefail
@@ -131,9 +149,13 @@ exit status that is indistinguishable from an empty share, which is the exact
 confusion this tool exists to prevent. With it, the run stops at the mount and
 exits non-zero.
 
-Two things produce a confusing `mount error(13): Permission denied` before you
-have even reached a real authentication problem:
+Three things produce a confusing `mount error(13): Permission denied` before
+you have even reached a real authentication problem. In likelihood order on a
+Linux host:
 
+- **AppArmor denied the mount**, as above. This is the one to rule out first on
+  Debian or Ubuntu, and the giveaway is that `dmesg` has no `CIFS: VFS:` lines
+  at all, because the kernel never got as far as talking to the server.
 - **The credentials file does not exist on the host.** Docker creates a
   *directory* at a bind-mount source that is missing, rather than failing, so
   `credentials=` is handed a directory, `mount.cifs` falls back to prompting
@@ -161,6 +183,7 @@ particular, so an unresponsive server fails visibly instead of hanging the scan
 forever:
 
     docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
+        --security-opt apparmor=unconfined \
         -v "$PWD":/out \
         --entrypoint bash fast-walk -c '
             set -euo pipefail
