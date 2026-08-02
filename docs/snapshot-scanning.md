@@ -159,6 +159,59 @@ One SMB-specific quirk: SMB is case-insensitive, but `fast-walk` groups by the
 literal extension text. `PHOTO.JPG` and `photo.jpg` are reported as two separate
 extensions, `JPG` and `jpg`. Sum them yourself when interpreting the results.
 
+## Tracking growth between snapshots
+
+Snapshots are what make growth measurable: two of them are two consistent
+pictures of the same share taken at known times, which is exactly what a
+comparison needs.
+
+Scan each one, keeping the results CSVs somewhere they will survive:
+
+```sh
+cd ~/scans
+fast-walk -p /mnt/snapshot/.snapshot/weekly.1 -t 4
+mv results-*.csv baseline.csv
+
+fast-walk -p /mnt/snapshot/.snapshot/nightly.0 -t 4
+mv results-*.csv current.csv
+```
+
+Then compare them. This reads the two files and rescans nothing, so it is
+instant and can be run long after the snapshots themselves have expired:
+
+```sh
+fast-walk --diff baseline.csv current.csv
+```
+
+The output is ordered by how much capacity moved, so whatever is driving growth
+appears first. Keeping one CSV per week gives you a growth trend per extension
+without needing anything else to store it.
+
+Two things to keep consistent between the scans being compared, or the
+difference will include your own change of method rather than real growth: use
+the same `--skip-hidden` setting for both, and scan an equivalent path in each
+snapshot rather than the live tree in one and a snapshot in the other.
+
+## Finding what is actually consuming the space
+
+The per-extension totals say `.mp4` is the problem; the largest-files report
+says which files to go and look at. It is on by default and costs nothing extra:
+
+```sh
+fast-walk -p /mnt/snapshot/.snapshot/nightly.0 --top 50
+```
+
+The age report, also produced automatically, is usually the more actionable one
+on a NAS: it groups capacity by how long ago each file was last modified, so you
+can see at a glance what share of a share has not been touched in over two
+years. That is the number that justifies an archive tier. The modification time
+comes from the `stat` the scan already performs, so it costs no additional
+round trips over the mount.
+
+Watch the `modified in future` band when scanning over a network. Files landing
+there mean the file server's clock and the scanning host's clock disagree, which
+makes every age figure from that server suspect until it is resolved.
+
 ## What the totals do and do not mean
 
 Two things are worth knowing before reporting these numbers to anyone.

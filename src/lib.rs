@@ -7,10 +7,16 @@
 use anyhow::{Context, Result};
 use jwalk::{Parallelism, WalkDir};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
+#[cfg(test)]
+use std::time::Duration;
+
+pub mod diff;
 
 /// Bucket used for files that have no extension (including dotfiles such as
 /// `.gitignore`, which `Path::extension` reports as extensionless).
@@ -19,6 +25,8 @@ pub const NO_EXTENSION: &str = "<none>";
 /// Number of individual walk errors kept for reporting before the rest are
 /// only counted.
 pub const MAX_REPORTED_ERRORS: usize = 10;
+
+const SECONDS_PER_DAY: u64 = 60 * 60 * 24;
 
 /// Running totals for a single extension.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +56,96 @@ impl Bucket {
     }
 }
 
+/// How old a file is, in the coarse bands used for the age report.
+///
+/// Declaration order is display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AgeBucket {
+    /// Modified after the scan began. Usually clock skew between the scanning
+    /// host and the file server rather than a genuine age.
+    Future,
+    UpTo30Days,
+    From30To90Days,
+    From90DaysTo1Year,
+    From1To2Years,
+    Over2Years,
+    /// The filesystem did not report a modification time.
+    Unknown,
+}
+
+impl AgeBucket {
+    /// Every bucket, in display order.
+    pub const ALL: [AgeBucket; 7] = [
+        AgeBucket::Future,
+        AgeBucket::UpTo30Days,
+        AgeBucket::From30To90Days,
+        AgeBucket::From90DaysTo1Year,
+        AgeBucket::From1To2Years,
+        AgeBucket::Over2Years,
+        AgeBucket::Unknown,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AgeBucket::Future => "modified in future",
+            AgeBucket::UpTo30Days => "under 30 days",
+            AgeBucket::From30To90Days => "30 to 90 days",
+            AgeBucket::From90DaysTo1Year => "90 days to 1 year",
+            AgeBucket::From1To2Years => "1 to 2 years",
+            AgeBucket::Over2Years => "over 2 years",
+            AgeBucket::Unknown => "unknown",
+        }
+    }
+}
+
+/// Place a modification time into an [`AgeBucket`] relative to `now`.
+///
+/// A year is treated as 365 days; the bands are coarse enough that leap days
+/// make no difference. A time later than `now` is reported as
+/// [`AgeBucket::Future`] rather than being clamped, since it means the clocks
+/// disagree and the age is not trustworthy.
+pub fn classify_age(modified: Option<SystemTime>, now: SystemTime) -> AgeBucket {
+    let Some(modified) = modified else {
+        return AgeBucket::Unknown;
+    };
+
+    let Ok(age) = now.duration_since(modified) else {
+        return AgeBucket::Future;
+    };
+
+    match age.as_secs() / SECONDS_PER_DAY {
+        0..=29 => AgeBucket::UpTo30Days,
+        30..=89 => AgeBucket::From30To90Days,
+        90..=364 => AgeBucket::From90DaysTo1Year,
+        365..=729 => AgeBucket::From1To2Years,
+        _ => AgeBucket::Over2Years,
+    }
+}
+
+/// One of the largest files seen during a scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargestFile {
+    pub path: PathBuf,
+    pub bytes: u64,
+}
+
+impl Ord for LargestFile {
+    /// Greater means "belongs nearer the top of the report": bigger first,
+    /// and for equal sizes the earlier path, so output does not depend on the
+    /// order threads happened to visit files in.
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.bytes
+            .cmp(&other.bytes)
+            .then_with(|| other.path.cmp(&self.path))
+    }
+}
+
+impl PartialOrd for LargestFile {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// How the walk should be performed.
 pub struct ScanOptions {
     pub max_depth: usize,
@@ -55,6 +153,9 @@ pub struct ScanOptions {
     /// Leave hidden files and directories out of the totals. Off by default,
     /// so dot-directories such as `.git` are counted.
     pub skip_hidden: bool,
+    /// How many of the largest files to retain. Zero disables the report and
+    /// avoids the per-file path allocation entirely.
+    pub top: usize,
 }
 
 impl Default for ScanOptions {
@@ -63,6 +164,66 @@ impl Default for ScanOptions {
             max_depth: usize::MAX,
             threads: num_cpus::get(),
             skip_hidden: false,
+            top: 10,
+        }
+    }
+}
+
+/// Per-thread accumulator, merged once per rayon worker rather than per file.
+#[derive(Default)]
+struct Partial {
+    extensions: HashMap<String, Bucket>,
+    ages: HashMap<AgeBucket, Bucket>,
+    /// Min-heap, so the smallest retained file is the one evicted.
+    largest: BinaryHeap<Reverse<LargestFile>>,
+}
+
+impl Partial {
+    /// Offer a file to the largest-files heap.
+    ///
+    /// The path is produced lazily: building it allocates, and the vast
+    /// majority of files in a large scan are never candidates.
+    fn consider<F>(&mut self, bytes: u64, top: usize, path: F)
+    where
+        F: FnOnce() -> PathBuf,
+    {
+        if top == 0 {
+            return;
+        }
+
+        if self.largest.len() < top {
+            self.largest.push(Reverse(LargestFile { path: path(), bytes }));
+            return;
+        }
+
+        // Reject without allocating whenever the file cannot possibly place.
+        // Equal sizes still go through, so the tie-break decides rather than
+        // arrival order.
+        match self.largest.peek() {
+            Some(Reverse(smallest)) if bytes < smallest.bytes => return,
+            None => return,
+            _ => {}
+        }
+
+        self.absorb(LargestFile { path: path(), bytes }, top);
+    }
+
+    fn absorb(&mut self, file: LargestFile, top: usize) {
+        self.largest.push(Reverse(file));
+        if self.largest.len() > top {
+            self.largest.pop();
+        }
+    }
+
+    fn merge(&mut self, other: Partial, top: usize) {
+        for (extension, bucket) in other.extensions {
+            self.extensions.entry(extension).or_default().merge(bucket);
+        }
+        for (age, bucket) in other.ages {
+            self.ages.entry(age).or_default().merge(bucket);
+        }
+        for Reverse(file) in other.largest {
+            self.absorb(file, top);
         }
     }
 }
@@ -83,6 +244,10 @@ impl Progress for NoProgress {}
 #[derive(Debug, Default)]
 pub struct Scan {
     pub totals: HashMap<String, Bucket>,
+    /// Totals by file age. Buckets with no files are absent.
+    pub ages: HashMap<AgeBucket, Bucket>,
+    /// The largest files found, biggest first, at most `ScanOptions::top`.
+    pub largest: Vec<LargestFile>,
     /// First [`MAX_REPORTED_ERRORS`] walk failures, for display.
     pub walk_errors: Vec<String>,
     /// Total number of walk failures, including any beyond those retained.
@@ -120,6 +285,14 @@ impl Scan {
         } else {
             self.total_bytes() as f64 / count as f64
         }
+    }
+
+    /// Age buckets in display order, skipping any that hold no files.
+    pub fn age_rows(&self) -> Vec<(AgeBucket, Bucket)> {
+        AgeBucket::ALL
+            .iter()
+            .filter_map(|age| self.ages.get(age).map(|bucket| (*age, *bucket)))
+            .collect()
     }
 }
 
@@ -187,39 +360,59 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
     // Files that vanished or became unreadable between the walk and the stat.
     let unmeasurable = AtomicU64::new(0);
 
-    // Each rayon thread aggregates into its own map and the maps are merged at
-    // the end, so no lock is taken on the per-file path.
-    let totals: HashMap<String, Bucket> = files
+    // Ages are measured against a single instant captured before any file is
+    // examined, so a long scan does not drift files between buckets.
+    let now = SystemTime::now();
+
+    // Each rayon thread aggregates into its own accumulator and these are
+    // merged at the end, so no lock is taken on the per-file path.
+    let aggregated = files
         .par_iter()
-        .fold(
-            HashMap::new,
-            |mut acc: HashMap<String, Bucket>, entry| {
-                progress.file_measured();
+        .fold(Partial::default, |mut acc: Partial, entry| {
+            progress.file_measured();
 
-                let size = match entry.metadata() {
-                    Ok(metadata) => metadata.len(),
-                    Err(_) => {
-                        unmeasurable.fetch_add(1, Ordering::Relaxed);
-                        return acc;
-                    }
-                };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    unmeasurable.fetch_add(1, Ordering::Relaxed);
+                    return acc;
+                }
+            };
 
-                acc.entry(extension_of(entry.file_name()))
-                    .or_default()
-                    .add_file(size);
+            let size = metadata.len();
 
-                acc
-            },
-        )
-        .reduce(HashMap::new, |mut acc, partial| {
-            for (extension, bucket) in partial {
-                acc.entry(extension).or_default().merge(bucket);
-            }
+            acc.extensions
+                .entry(extension_of(entry.file_name()))
+                .or_default()
+                .add_file(size);
+
+            // The modification time comes from the stat already performed, so
+            // the age report costs no extra syscalls.
+            acc.ages
+                .entry(classify_age(metadata.modified().ok(), now))
+                .or_default()
+                .add_file(size);
+
+            acc.consider(size, options.top, || entry.path());
+
+            acc
+        })
+        .reduce(Partial::default, |mut acc, partial| {
+            acc.merge(partial, options.top);
             acc
         });
 
+    let mut largest: Vec<LargestFile> = aggregated
+        .largest
+        .into_iter()
+        .map(|Reverse(file)| file)
+        .collect();
+    largest.sort_by(|a, b| b.cmp(a));
+
     Ok(Scan {
-        totals,
+        totals: aggregated.extensions,
+        ages: aggregated.ages,
+        largest,
         walk_errors,
         walk_error_count,
         unmeasurable_files: unmeasurable.load(Ordering::Relaxed),
@@ -365,5 +558,162 @@ mod tests {
 
         assert_eq!(scan.average_bytes(), 0.0);
         assert!(scan.average_bytes().is_finite());
+    }
+
+    /// A fixed instant to measure ages against, so the tests do not depend on
+    /// the wall clock.
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(30 * 365 * SECONDS_PER_DAY)
+    }
+
+    fn days_ago(days: u64) -> Option<SystemTime> {
+        Some(now() - Duration::from_secs(days * SECONDS_PER_DAY))
+    }
+
+    #[test]
+    fn ages_land_in_the_expected_band() {
+        assert_eq!(classify_age(days_ago(0), now()), AgeBucket::UpTo30Days);
+        assert_eq!(classify_age(days_ago(15), now()), AgeBucket::UpTo30Days);
+        assert_eq!(classify_age(days_ago(45), now()), AgeBucket::From30To90Days);
+        assert_eq!(
+            classify_age(days_ago(200), now()),
+            AgeBucket::From90DaysTo1Year
+        );
+        assert_eq!(classify_age(days_ago(500), now()), AgeBucket::From1To2Years);
+        assert_eq!(classify_age(days_ago(3000), now()), AgeBucket::Over2Years);
+    }
+
+    #[test]
+    fn age_band_boundaries_do_not_overlap_or_leave_gaps() {
+        // Each boundary belongs to the older band, and the day before it does
+        // not.
+        assert_eq!(classify_age(days_ago(29), now()), AgeBucket::UpTo30Days);
+        assert_eq!(classify_age(days_ago(30), now()), AgeBucket::From30To90Days);
+
+        assert_eq!(classify_age(days_ago(89), now()), AgeBucket::From30To90Days);
+        assert_eq!(
+            classify_age(days_ago(90), now()),
+            AgeBucket::From90DaysTo1Year
+        );
+
+        assert_eq!(
+            classify_age(days_ago(364), now()),
+            AgeBucket::From90DaysTo1Year
+        );
+        assert_eq!(classify_age(days_ago(365), now()), AgeBucket::From1To2Years);
+
+        assert_eq!(classify_age(days_ago(729), now()), AgeBucket::From1To2Years);
+        assert_eq!(classify_age(days_ago(730), now()), AgeBucket::Over2Years);
+    }
+
+    #[test]
+    fn a_modification_time_in_the_future_is_flagged_not_treated_as_new() {
+        // Clock skew between a scanning host and a file server is common, and
+        // silently calling such files "under 30 days" would hide it.
+        let ahead = now() + Duration::from_secs(SECONDS_PER_DAY);
+
+        assert_eq!(classify_age(Some(ahead), now()), AgeBucket::Future);
+    }
+
+    #[test]
+    fn a_missing_modification_time_is_unknown_rather_than_a_guess() {
+        assert_eq!(classify_age(None, now()), AgeBucket::Unknown);
+    }
+
+    #[test]
+    fn age_rows_come_back_in_display_order_and_skip_empty_bands() {
+        let mut scan = Scan::default();
+        scan.ages.insert(
+            AgeBucket::Over2Years,
+            Bucket {
+                count: 1,
+                bytes: 1,
+            },
+        );
+        scan.ages.insert(
+            AgeBucket::UpTo30Days,
+            Bucket {
+                count: 2,
+                bytes: 2,
+            },
+        );
+
+        let order: Vec<AgeBucket> = scan.age_rows().iter().map(|(age, _)| *age).collect();
+
+        assert_eq!(order, [AgeBucket::UpTo30Days, AgeBucket::Over2Years]);
+    }
+
+    #[test]
+    fn every_age_bucket_has_a_label() {
+        for age in AgeBucket::ALL {
+            assert!(!age.label().is_empty());
+        }
+    }
+
+    fn file(path: &str, bytes: u64) -> LargestFile {
+        LargestFile {
+            path: PathBuf::from(path),
+            bytes,
+        }
+    }
+
+    #[test]
+    fn larger_files_sort_ahead_of_smaller_ones() {
+        assert!(file("a", 100) > file("b", 10));
+    }
+
+    #[test]
+    fn equally_sized_files_are_ordered_by_path_so_results_are_reproducible() {
+        // "Greater" is what appears first, so the earlier path must win.
+        assert!(file("aaa", 100) > file("zzz", 100));
+    }
+
+    #[test]
+    fn the_heap_keeps_the_largest_and_evicts_the_rest() {
+        let mut partial = Partial::default();
+
+        for (path, bytes) in [("a", 10), ("b", 500), ("c", 1), ("d", 90)] {
+            partial.consider(bytes, 2, || PathBuf::from(path));
+        }
+
+        let mut kept: Vec<LargestFile> = partial
+            .largest
+            .into_iter()
+            .map(|Reverse(file)| file)
+            .collect();
+        kept.sort_by(|a, b| b.cmp(a));
+
+        assert_eq!(kept, vec![file("b", 500), file("d", 90)]);
+    }
+
+    #[test]
+    fn a_top_of_zero_keeps_nothing() {
+        let mut partial = Partial::default();
+
+        partial.consider(500, 0, || PathBuf::from("a"));
+
+        assert!(partial.largest.is_empty());
+    }
+
+    #[test]
+    fn equally_sized_files_beyond_the_limit_are_resolved_by_path_not_arrival() {
+        // Feeding the same files in opposite orders must give the same answer,
+        // otherwise parallel scans would not be reproducible.
+        let insert = |order: [&str; 3]| {
+            let mut partial = Partial::default();
+            for path in order {
+                partial.consider(100, 2, || PathBuf::from(path));
+            }
+            let mut kept: Vec<LargestFile> = partial
+                .largest
+                .into_iter()
+                .map(|Reverse(file)| file)
+                .collect();
+            kept.sort_by(|a, b| b.cmp(a));
+            kept
+        };
+
+        assert_eq!(insert(["a", "b", "c"]), insert(["c", "b", "a"]));
+        assert_eq!(insert(["a", "b", "c"]), vec![file("a", 100), file("b", 100)]);
     }
 }

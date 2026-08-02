@@ -1,10 +1,26 @@
 //! End-to-end tests for [`fast_walk::scan`] against real directory trees.
 
-use fast_walk::{scan, Bucket, NoProgress, Scan, ScanOptions, NO_EXTENSION};
+use fast_walk::{scan, AgeBucket, Bucket, NoProgress, Scan, ScanOptions, NO_EXTENSION};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
+
+const SECONDS_PER_DAY: u64 = 60 * 60 * 24;
+
+/// Write a file and backdate its modification time.
+fn write_aged_file(root: &Path, relative: &str, size: usize, days_old: u64) {
+    write_file(root, relative, size);
+
+    let when = SystemTime::now() - Duration::from_secs(days_old * SECONDS_PER_DAY);
+    fs::File::options()
+        .write(true)
+        .open(root.join(relative))
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
 
 /// Write a file of exactly `size` bytes, creating parent directories as needed.
 fn write_file(root: &Path, relative: &str, size: usize) {
@@ -178,6 +194,145 @@ fn rows_are_sorted_by_descending_count() {
     let order: Vec<&str> = scan.rows().iter().map(|(extension, _)| *extension).collect();
 
     assert_eq!(order, ["rs", "md", "txt"]);
+}
+
+#[test]
+fn files_are_bucketed_by_how_long_ago_they_were_modified() {
+    let dir = TempDir::new().unwrap();
+    write_aged_file(dir.path(), "fresh.txt", 10, 1);
+    write_aged_file(dir.path(), "recent.txt", 20, 45);
+    write_aged_file(dir.path(), "stale.txt", 40, 200);
+    write_aged_file(dir.path(), "ancient.txt", 80, 1500);
+
+    let scan = scan_dir(dir.path());
+
+    assert_eq!(scan.ages[&AgeBucket::UpTo30Days], Bucket { count: 1, bytes: 10 });
+    assert_eq!(
+        scan.ages[&AgeBucket::From30To90Days],
+        Bucket { count: 1, bytes: 20 }
+    );
+    assert_eq!(
+        scan.ages[&AgeBucket::From90DaysTo1Year],
+        Bucket { count: 1, bytes: 40 }
+    );
+    assert_eq!(scan.ages[&AgeBucket::Over2Years], Bucket { count: 1, bytes: 80 });
+}
+
+#[test]
+fn the_age_buckets_account_for_every_file_exactly_once() {
+    let dir = TempDir::new().unwrap();
+    write_aged_file(dir.path(), "a.txt", 10, 1);
+    write_aged_file(dir.path(), "b.txt", 20, 45);
+    write_aged_file(dir.path(), "c.txt", 40, 800);
+
+    let scan = scan_dir(dir.path());
+
+    let aged_files: u64 = scan.ages.values().map(|bucket| bucket.count).sum();
+    let aged_bytes: u64 = scan.ages.values().map(|bucket| bucket.bytes).sum();
+
+    assert_eq!(aged_files, scan.total_files());
+    assert_eq!(aged_bytes, scan.total_bytes());
+}
+
+#[test]
+fn a_file_modified_in_the_future_is_reported_separately() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "skewed.txt", 10);
+
+    let ahead = SystemTime::now() + Duration::from_secs(7 * SECONDS_PER_DAY);
+    fs::File::options()
+        .write(true)
+        .open(dir.path().join("skewed.txt"))
+        .unwrap()
+        .set_modified(ahead)
+        .unwrap();
+
+    let scan = scan_dir(dir.path());
+
+    assert_eq!(scan.ages[&AgeBucket::Future], Bucket { count: 1, bytes: 10 });
+}
+
+#[test]
+fn the_largest_files_are_reported_biggest_first() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "small.bin", 10);
+    write_file(dir.path(), "huge.bin", 5000);
+    write_file(dir.path(), "nested/medium.bin", 900);
+    write_file(dir.path(), "tiny.bin", 1);
+
+    let scan = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            top: 2,
+            ..ScanOptions::default()
+        },
+    );
+
+    let names: Vec<String> = scan
+        .largest
+        .iter()
+        .map(|file| file.path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+
+    assert_eq!(names, ["huge.bin", "medium.bin"]);
+    assert_eq!(scan.largest[0].bytes, 5000);
+    assert_eq!(scan.largest[1].bytes, 900);
+}
+
+#[test]
+fn asking_for_more_largest_files_than_exist_returns_what_there_is() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "a.bin", 10);
+    write_file(dir.path(), "b.bin", 20);
+
+    let scan = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            top: 50,
+            ..ScanOptions::default()
+        },
+    );
+
+    assert_eq!(scan.largest.len(), 2);
+}
+
+#[test]
+fn a_top_of_zero_turns_the_largest_files_report_off() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "a.bin", 10);
+
+    let scan = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            top: 0,
+            ..ScanOptions::default()
+        },
+    );
+
+    assert!(scan.largest.is_empty());
+    // The rest of the report is unaffected.
+    assert_eq!(scan.total_files(), 1);
+}
+
+#[test]
+fn equally_sized_files_produce_the_same_list_on_every_run() {
+    // Threads finish in whatever order they like, so ties have to be broken by
+    // something stable or repeated scans would disagree.
+    let dir = TempDir::new().unwrap();
+    for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        write_file(dir.path(), &format!("{name}.bin"), 100);
+    }
+
+    let options = || ScanOptions {
+        top: 3,
+        ..ScanOptions::default()
+    };
+
+    let first = scan_dir_with(dir.path(), options());
+    for _ in 0..5 {
+        let again = scan_dir_with(dir.path(), options());
+        assert_eq!(first.largest, again.largest);
+    }
 }
 
 #[cfg(unix)]

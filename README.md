@@ -25,10 +25,13 @@ Run app in terminal.
 
     OPTIONS:
         -h, --help                     Print help information
+        -V, --version                  Print version
         -m, --max-depth <MAX_DEPTH>    [default: 18446744073709551615]
         -p, --path <PATH>
         -t, --threads <THREADS>        [default: 8]
             --skip-hidden              Skip hidden files and directories
+            --top <TOP>                Largest files to report, 0 disables [default: 10]
+            --diff <OLD> <NEW>         Compare two results CSVs instead of scanning
 
 Example running on the same directory as the application, max depth 5, threads 4
 
@@ -67,6 +70,64 @@ the summary line reports the average across every file scanned.
 The CSV reports capacity and average size in bytes. The terminal table reports
 capacity in MB and scales the average to whichever unit suits it, since average
 file sizes are usually far below a megabyte.
+
+A scan writes three CSVs, sharing one name stem:
+
+| File | Contents |
+| --- | --- |
+| `results-XXXXXX.csv` | totals per extension |
+| `results-XXXXXX-age.csv` | totals per age band |
+| `results-XXXXXX-largest.csv` | the largest files found |
+
+### By age
+
+Files are also grouped by how long ago they were last modified, into bands of
+under 30 days, 30 to 90 days, 90 days to a year, 1 to 2 years, and over 2 years,
+with each band's share of total capacity. This is what tells you how much of a
+share is cold data.
+
+The modification time comes from the same `stat` the scan already performs, so
+the age report costs nothing extra — including over a network mount.
+
+Two bands exist for data that cannot be aged normally. Files modified *after*
+the scan started are reported as `modified in future` rather than being counted
+as new; this normally means the clocks on the scanning host and the file server
+disagree. Files whose modification time the filesystem does not report land in
+`unknown`.
+
+### Largest files
+
+The largest files found are listed with their full paths, ten by default.
+`--top 50` asks for more, `--top 0` turns the report off. Aggregates tell you
+which extension is consuming capacity; this tells you which files to go look at.
+
+### Comparing two scans
+
+Point `--diff` at the extension CSVs from two earlier runs to see what changed
+between them. Nothing is rescanned, so snapshots taken weeks apart can be
+compared long after the fact:
+
+    fast-walk --diff results-monday.csv results-friday.csv
+
+    Files: 3 -> 4 (+1)
+    Capacity: 2.1 MB -> 11.2 MB (+9.1 MB)
+
+    ╭────────────┬─────────┬────────────┬────────────┬───────────╮
+    │ Extension  │ Δ Files │ Δ Capacity │ Cap Before │ Cap After │
+    ╞════════════╪═════════╪════════════╪════════════╪═══════════╡
+    │ mp4        │ +1      │ +8.6 MB    │ 1.9 MB     │ 10.5 MB   │
+    │ docx       │ 0       │ +293.0 KB  │ 97.7 KB    │ 390.6 KB  │
+    │ pdf (new)  │ +1      │ +293.0 KB  │ 0 B        │ 293.0 KB  │
+    │ txt (gone) │ -1      │ -48.8 KB   │ 48.8 KB    │ 0 B       │
+    ╰────────────┴─────────┴────────────┴────────────┴───────────╯
+
+Extensions that did not change are left out, and the rest are ordered by how
+much capacity moved, in either direction. Extensions present in only one of the
+two scans are marked `(new)` or `(gone)`. The comparison is written to a
+`diff-XXXXXX.csv` alongside the terminal output.
+
+Columns are matched by header name, so a CSV written by a different version of
+the tool still reads as long as it carries `Extension`, `Qty` and `Cap Bytes`.
 
 Sizes are apparent file sizes rather than space consumed on disk, and a hard
 linked file is counted once per name. See
