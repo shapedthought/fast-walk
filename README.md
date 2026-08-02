@@ -55,9 +55,39 @@ the container rather than on the host. That means you do not need mount helpers
 on the machine you are running from, and the mount disappears when the
 container exits rather than being left behind.
 
-Mounting needs `CAP_SYS_ADMIN` for `mount` itself and `CAP_DAC_READ_SEARCH` for
+Mounting needs two Linux capabilities that a container does not get by default,
+and they are granted with `--cap-add` on the `docker run` line itself:
+
+    docker run --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH ...
+
+One `--cap-add` per capability; there is no combined form. The names are
+case-insensitive and the `CAP_` prefix is optional, so `--cap-add
+CAP_SYS_ADMIN` and `--cap-add sys_admin` do the same thing. Under Docker
+Compose the same two go in a `cap_add:` list on the service and produce an
+identical result:
+
+    services:
+      scan:
+        image: fast-walk
+        cap_add:
+          - SYS_ADMIN
+          - DAC_READ_SEARCH
+
+The Kubernetes equivalent is `securityContext.capabilities.add`, which has not
+been tried here.
+
+`CAP_SYS_ADMIN` is for `mount` itself. `CAP_DAC_READ_SEARCH` is for
 `mount.cifs`, which is setuid and gives up with `Unable to apply new capability
-set` without it. Those two are enough; `--privileged` is not required.
+set` without it — `SYS_ADMIN` on its own is not enough, and adding `SETPCAP`
+instead does not help. Those two together are enough; `--privileged` is not
+required, which is worth keeping that way given what these containers get
+pointed at.
+
+To check what a container actually ended up with rather than what you meant to
+ask for, run `grep CapEff /proc/self/status` inside it. On Docker 29.6 the
+default came out as `00000000a80425fb` and those two capabilities took it to
+`00000000a82425ff`; the exact value depends on the daemon's default set, so
+compare a run with and without the flags rather than trusting the number.
 
 SMB needs credentials. Passing them as `-o user=...,password=...` puts the
 password in `ps` output and in your shell history, so `mount.cifs` reads them
