@@ -36,6 +36,11 @@ locally on the server and over SMB from another machine produces identical
 output across all five reports, down to the byte.** Other people's results can
 reinforce or break that.
 
+That run predates the directory structure report, which was the sixth report to
+be added. Nothing about it is expected to differ over SMB — it is fed from the
+same directory listings as everything else — but that is reasoning, not a
+result, and the row above should not be read as covering it.
+
 Findings from those runs that changed the tool or the documentation are written
 up in [docs/snapshot-scanning.md](docs/snapshot-scanning.md).
 

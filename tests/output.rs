@@ -6,7 +6,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 /// Every report a scan produces, as suffixes on the chosen stem.
-const REPORTS: [&str; 5] = ["", "-age", "-size", "-hotspots", "-largest"];
+const REPORTS: [&str; 6] = ["", "-age", "-size", "-structure", "-hotspots", "-largest"];
 
 fn tree_with_a_file() -> TempDir {
     let tree = TempDir::new().unwrap();

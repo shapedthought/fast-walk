@@ -11,7 +11,7 @@ use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
@@ -259,6 +259,444 @@ impl PartialOrd for LargestFile {
     }
 }
 
+/// Levels given a row of their own in the structure report. A tree deeper
+/// than this is counted and its depth still reported exactly, but the entries
+/// share one overflow row: the array of counters is fixed so that the walk
+/// threads can accumulate into it without locking.
+pub const MAX_TRACKED_DEPTH: usize = 64;
+
+/// Path length at which a tree starts to break backup agents on Windows, and
+/// the reason path lengths are reported at all.
+pub const LONG_PATH_LIMIT: usize = 260;
+
+/// How many subdirectories one directory holds.
+///
+/// Bands rather than exact counts: the report is meant to describe the shape
+/// of a tree to someone who should not see what is in it. Declaration order is
+/// display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FanOut {
+    /// No subdirectories at all, so a leaf of the tree.
+    Leaf,
+    One,
+    From2To9,
+    From10To99,
+    From100To999,
+    Over1000,
+}
+
+impl FanOut {
+    /// Every band, fewest subdirectories first. Declaration order is display
+    /// order.
+    pub const ALL: [FanOut; 6] = [
+        FanOut::Leaf,
+        FanOut::One,
+        FanOut::From2To9,
+        FanOut::From10To99,
+        FanOut::From100To999,
+        FanOut::Over1000,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FanOut::Leaf => "none (leaf)",
+            FanOut::One => "1",
+            FanOut::From2To9 => "2 to 9",
+            FanOut::From10To99 => "10 to 99",
+            FanOut::From100To999 => "100 to 999",
+            FanOut::Over1000 => "1000 or more",
+        }
+    }
+
+    /// Position in [`FanOut::ALL`], used to index the lock-free counters.
+    fn index(self) -> usize {
+        match self {
+            FanOut::Leaf => 0,
+            FanOut::One => 1,
+            FanOut::From2To9 => 2,
+            FanOut::From10To99 => 3,
+            FanOut::From100To999 => 4,
+            FanOut::Over1000 => 5,
+        }
+    }
+}
+
+/// Place a subdirectory count into a [`FanOut`] band.
+pub fn classify_fan_out(subdirectories: u64) -> FanOut {
+    match subdirectories {
+        0 => FanOut::Leaf,
+        1 => FanOut::One,
+        2..=9 => FanOut::From2To9,
+        10..=99 => FanOut::From10To99,
+        100..=999 => FanOut::From100To999,
+        _ => FanOut::Over1000,
+    }
+}
+
+/// How many files one directory holds directly, not counting its
+/// subdirectories.
+///
+/// Declaration order is display order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FileCount {
+    /// Holds no files, only subdirectories or nothing at all.
+    None,
+    From1To9,
+    From10To99,
+    From100To999,
+    From1000To9999,
+    Over10000,
+}
+
+impl FileCount {
+    /// Every band, fewest files first. Declaration order is display order.
+    pub const ALL: [FileCount; 6] = [
+        FileCount::None,
+        FileCount::From1To9,
+        FileCount::From10To99,
+        FileCount::From100To999,
+        FileCount::From1000To9999,
+        FileCount::Over10000,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FileCount::None => "none",
+            FileCount::From1To9 => "1 to 9",
+            FileCount::From10To99 => "10 to 99",
+            FileCount::From100To999 => "100 to 999",
+            FileCount::From1000To9999 => "1000 to 9999",
+            FileCount::Over10000 => "10000 or more",
+        }
+    }
+
+    /// Position in [`FileCount::ALL`], used to index the lock-free counters.
+    fn index(self) -> usize {
+        match self {
+            FileCount::None => 0,
+            FileCount::From1To9 => 1,
+            FileCount::From10To99 => 2,
+            FileCount::From100To999 => 3,
+            FileCount::From1000To9999 => 4,
+            FileCount::Over10000 => 5,
+        }
+    }
+}
+
+/// Place a directory's own file count into a [`FileCount`] band.
+pub fn classify_file_count(files: u64) -> FileCount {
+    match files {
+        0 => FileCount::None,
+        1..=9 => FileCount::From1To9,
+        10..=99 => FileCount::From10To99,
+        100..=999 => FileCount::From100To999,
+        1000..=9999 => FileCount::From1000To9999,
+        _ => FileCount::Over10000,
+    }
+}
+
+/// A set of directories counted together, and the files that go with them.
+///
+/// What "the files that go with them" means depends on the report: for a
+/// level it is the files sitting at that level, and for a band it is the files
+/// held by the directories in the band. Each accessor says which.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DirectoryGroup {
+    pub directories: u64,
+    pub files: u64,
+}
+
+impl DirectoryGroup {
+    fn is_empty(&self) -> bool {
+        self.directories == 0 && self.files == 0
+    }
+}
+
+/// The shape of the scanned tree, described without naming anything in it.
+///
+/// Every figure is a count or a length, so the report says how the data is
+/// laid out without disclosing a single directory name.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Structure {
+    /// Entries per level, indexed by depth. Level 0 is the scan root itself
+    /// and level 1 its immediate children, matching
+    /// [`ScanOptions::max_depth`]. Files count at the level they sit at, not
+    /// at the level of the directory holding them.
+    pub levels: Vec<DirectoryGroup>,
+    /// Entries deeper than [`MAX_TRACKED_DEPTH`], which get no level of their
+    /// own.
+    pub beyond_tracked: DirectoryGroup,
+    /// Depth of the deepest entry counted. Tracked exactly, including past
+    /// [`MAX_TRACKED_DEPTH`].
+    pub deepest: usize,
+    /// Every directory in the tree, the root included, whether or not it could
+    /// be read.
+    pub directories: u64,
+    /// Directories whose contents were actually listed. Only these appear in
+    /// the band reports, since the others have no known contents.
+    pub listed_directories: u64,
+    /// Listed directories by how many subdirectories they hold, with the files
+    /// they hold directly.
+    pub fan_out: HashMap<FanOut, DirectoryGroup>,
+    /// Listed directories by how many files they hold directly, with those
+    /// files.
+    pub file_counts: HashMap<FileCount, DirectoryGroup>,
+    /// Longest path below the scan root, in bytes of the encoded path. The
+    /// root's own prefix is excluded because it changes when the tree is
+    /// copied or restored somewhere else.
+    pub longest_path: usize,
+    /// Entries whose path below the root is longer than [`LONG_PATH_LIMIT`].
+    pub long_paths: DirectoryGroup,
+}
+
+impl Structure {
+    /// Levels paired with their depth, root first, skipping any that hold
+    /// nothing. The `files` of a row are the files at that level.
+    ///
+    /// Anything past [`MAX_TRACKED_DEPTH`] is in `beyond_tracked` rather than
+    /// here.
+    pub fn level_rows(&self) -> Vec<(usize, DirectoryGroup)> {
+        self.levels
+            .iter()
+            .enumerate()
+            .filter(|(_, group)| !group.is_empty())
+            .map(|(depth, group)| (depth, *group))
+            .collect()
+    }
+
+    /// Fan-out bands in display order, skipping any holding no directories.
+    /// The `files` of a row are the files held by those directories.
+    pub fn fan_out_rows(&self) -> Vec<(FanOut, DirectoryGroup)> {
+        FanOut::ALL
+            .iter()
+            .filter_map(|band| self.fan_out.get(band).map(|group| (*band, *group)))
+            .collect()
+    }
+
+    /// File-count bands in display order, skipping any holding no directories.
+    /// The `files` of a row are the files held by those directories.
+    pub fn file_count_rows(&self) -> Vec<(FileCount, DirectoryGroup)> {
+        FileCount::ALL
+            .iter()
+            .filter_map(|band| self.file_counts.get(band).map(|group| (*band, *group)))
+            .collect()
+    }
+
+    /// Directories counted but never listed, because the depth limit stopped
+    /// the walk or the directory could not be read. They are missing from the
+    /// band reports, so a report that has any must say so.
+    pub fn unlisted_directories(&self) -> u64 {
+        self.directories.saturating_sub(self.listed_directories)
+    }
+
+    /// Every file the walk saw below the root.
+    ///
+    /// Taken from the walk rather than from the measuring pass, so it includes
+    /// any file that was listed but could not afterwards be measured.
+    pub fn files(&self) -> u64 {
+        self.file_counts.values().map(|group| group.files).sum()
+    }
+
+    /// Mean number of files held directly by a listed directory, or zero if
+    /// nothing was listed.
+    pub fn mean_files_per_directory(&self) -> f64 {
+        if self.listed_directories == 0 {
+            0.0
+        } else {
+            self.files() as f64 / self.listed_directories as f64
+        }
+    }
+}
+
+/// Lock-free accumulator for [`Structure`].
+///
+/// The walk threads touch this once per directory rather than once per file,
+/// so the counters are contended by the number of directories in the tree and
+/// not by its size. Every field is a fixed-size counter, so unlike the hotspot
+/// map the memory does not grow with the tree.
+struct StructureCounters {
+    levels: Vec<DirectoryCounters>,
+    beyond_tracked: DirectoryCounters,
+    deepest: AtomicUsize,
+    /// The root is added separately, since no parent lists it.
+    directories: AtomicU64,
+    listed: AtomicU64,
+    fan_out: [DirectoryCounters; FanOut::ALL.len()],
+    file_counts: [DirectoryCounters; FileCount::ALL.len()],
+    longest_path: AtomicUsize,
+    long_path_directories: AtomicU64,
+    long_path_files: AtomicU64,
+}
+
+#[derive(Default)]
+struct DirectoryCounters {
+    directories: AtomicU64,
+    files: AtomicU64,
+}
+
+impl DirectoryCounters {
+    fn add(&self, directories: u64, files: u64) {
+        self.directories.fetch_add(directories, Ordering::Relaxed);
+        self.files.fetch_add(files, Ordering::Relaxed);
+    }
+
+    fn take(&self) -> DirectoryGroup {
+        DirectoryGroup {
+            directories: self.directories.load(Ordering::Relaxed),
+            files: self.files.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl StructureCounters {
+    fn new() -> Self {
+        Self {
+            levels: (0..=MAX_TRACKED_DEPTH)
+                .map(|_| DirectoryCounters::default())
+                .collect(),
+            beyond_tracked: DirectoryCounters::default(),
+            deepest: AtomicUsize::new(0),
+            directories: AtomicU64::new(0),
+            listed: AtomicU64::new(0),
+            fan_out: Default::default(),
+            file_counts: Default::default(),
+            longest_path: AtomicUsize::new(0),
+            long_path_directories: AtomicU64::new(0),
+            long_path_files: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one directory whose contents have just been listed.
+    ///
+    /// `depth` is the directory's own depth, so its children sit one level
+    /// below it. Entries that are neither a file nor a directory, such as an
+    /// unfollowed symlink, are left out of both counts, matching the way the
+    /// rest of the scan treats them.
+    fn record(
+        &self,
+        depth: usize,
+        relative_length: usize,
+        children: impl IntoIterator<Item = Child>,
+    ) {
+        let mut files = 0u64;
+        let mut subdirectories = 0u64;
+        let mut long_files = 0u64;
+        let mut long_directories = 0u64;
+        let mut longest = 0usize;
+
+        // Children share the directory's path, so their own length only
+        // differs by the name and, below the root, one separator.
+        let prefix = if relative_length == 0 {
+            0
+        } else {
+            relative_length + 1
+        };
+
+        for child in children {
+            let length = prefix + child.name_length;
+
+            // Anything counted in neither total is left out of the length
+            // figures too, so the longest path reported is always the longest
+            // path among the entries the rest of the report describes.
+            if child.is_dir {
+                subdirectories += 1;
+                longest = longest.max(length);
+                if length > LONG_PATH_LIMIT {
+                    long_directories += 1;
+                }
+            } else if child.is_file {
+                files += 1;
+                longest = longest.max(length);
+                if length > LONG_PATH_LIMIT {
+                    long_files += 1;
+                }
+            }
+        }
+
+        self.listed.fetch_add(1, Ordering::Relaxed);
+        self.directories
+            .fetch_add(subdirectories, Ordering::Relaxed);
+        self.deepest.fetch_max(depth, Ordering::Relaxed);
+        self.longest_path.fetch_max(longest, Ordering::Relaxed);
+        self.long_path_directories
+            .fetch_add(long_directories, Ordering::Relaxed);
+        self.long_path_files
+            .fetch_add(long_files, Ordering::Relaxed);
+
+        if files > 0 || subdirectories > 0 {
+            let level = depth + 1;
+            self.deepest.fetch_max(level, Ordering::Relaxed);
+            match self.levels.get(level) {
+                Some(counters) => counters.add(subdirectories, files),
+                None => self.beyond_tracked.add(subdirectories, files),
+            }
+        }
+
+        self.fan_out[classify_fan_out(subdirectories).index()].add(1, files);
+        self.file_counts[classify_file_count(files).index()].add(1, files);
+    }
+
+    /// Collapse the counters into the reported [`Structure`].
+    ///
+    /// `root_is_directory` is false when the scan was pointed at a single
+    /// file, which has no level of its own to occupy.
+    fn finish(&self, root_is_directory: bool) -> Structure {
+        let mut levels: Vec<DirectoryGroup> =
+            self.levels.iter().map(DirectoryCounters::take).collect();
+        let mut directories = self.directories.load(Ordering::Relaxed);
+
+        if root_is_directory {
+            levels[0].directories += 1;
+            directories += 1;
+        }
+
+        // Trailing levels hold nothing once the deepest entry is passed, and a
+        // vector of empty rows is only noise for anything reading this.
+        while levels.last().is_some_and(DirectoryGroup::is_empty) {
+            levels.pop();
+        }
+
+        Structure {
+            levels,
+            beyond_tracked: self.beyond_tracked.take(),
+            deepest: self.deepest.load(Ordering::Relaxed),
+            directories,
+            listed_directories: self.listed.load(Ordering::Relaxed),
+            fan_out: banded(&self.fan_out, FanOut::ALL),
+            file_counts: banded(&self.file_counts, FileCount::ALL),
+            longest_path: self.longest_path.load(Ordering::Relaxed),
+            long_paths: DirectoryGroup {
+                directories: self.long_path_directories.load(Ordering::Relaxed),
+                files: self.long_path_files.load(Ordering::Relaxed),
+            },
+        }
+    }
+}
+
+/// Pair each band with its counters, dropping the bands nothing landed in.
+fn banded<B: Copy + Eq + std::hash::Hash, const N: usize>(
+    counters: &[DirectoryCounters; N],
+    bands: [B; N],
+) -> HashMap<B, DirectoryGroup> {
+    counters
+        .iter()
+        .map(DirectoryCounters::take)
+        .zip(bands)
+        .filter(|(group, _)| !group.is_empty())
+        .map(|(group, band)| (band, group))
+        .collect()
+}
+
+/// The little a directory's child needs to contribute to [`Structure`].
+///
+/// Reduced to this before counting so the accounting can be unit tested
+/// without a filesystem behind it.
+struct Child {
+    is_dir: bool,
+    is_file: bool,
+    name_length: usize,
+}
+
 /// How the walk should be performed.
 pub struct ScanOptions {
     pub max_depth: usize,
@@ -442,6 +880,8 @@ pub struct Scan {
     pub small_bytes: u64,
     /// The largest files found, biggest first, at most `ScanOptions::top`.
     pub largest: Vec<LargestFile>,
+    /// How the tree is laid out, in counts and lengths only.
+    pub structure: Structure,
     /// First [`MAX_REPORTED_ERRORS`] walk failures, for display.
     pub walk_errors: Vec<String>,
     /// Total number of walk failures, including any beyond those retained.
@@ -531,7 +971,8 @@ pub fn extension_of(file_name: &OsStr) -> String {
 pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Result<Scan> {
     // Fail loudly on a path that does not exist or cannot be read, rather than
     // reporting an empty scan as a success.
-    std::fs::metadata(path).with_context(|| format!("cannot read path: {}", path.display()))?;
+    let root_metadata =
+        std::fs::metadata(path).with_context(|| format!("cannot read path: {}", path.display()))?;
 
     // One pool for both halves of the scan. Handing jwalk a thread count of
     // its own while letting the measuring phase fall through to rayon's global
@@ -550,10 +991,43 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
     // one below it. That is not a partial result, it is no result.
     let mut root_unreadable: Option<String> = None;
 
+    // Fed once per directory from the walk threads, before any file is
+    // measured, so the shape of the tree costs no syscall of its own.
+    let structure = Arc::new(StructureCounters::new());
+    let counters = Arc::clone(&structure);
+    let root = path.to_path_buf();
+
     let files: Vec<_> = WalkDir::new(path)
         .sort(true)
         .skip_hidden(options.skip_hidden)
         .max_depth(options.max_depth)
+        .process_read_dir(move |depth, directory, _state, children| {
+            // The root entry is handed over with no depth of its own and no
+            // listing behind it, so there is nothing yet to describe.
+            let Some(depth) = depth else {
+                return;
+            };
+
+            // Measured below the root, since the prefix the tree currently
+            // sits under changes the moment it is copied anywhere else.
+            let relative_length = directory
+                .strip_prefix(&root)
+                .map(|below| below.as_os_str().len())
+                .unwrap_or_else(|_| directory.as_os_str().len());
+
+            counters.record(
+                depth,
+                relative_length,
+                children
+                    .iter()
+                    .filter_map(|entry| entry.as_ref().ok())
+                    .map(|entry| Child {
+                        is_dir: entry.file_type().is_dir(),
+                        is_file: entry.file_type().is_file(),
+                        name_length: entry.file_name().len(),
+                    }),
+            );
+        })
         .parallelism(Parallelism::RayonExistingPool {
             pool: Arc::clone(&pool),
             // The pool is built here and used by nothing else, so there is
@@ -702,6 +1176,7 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
         small_files: aggregated.small_files,
         small_bytes: aggregated.small_bytes,
         largest,
+        structure: structure.finish(root_metadata.is_dir()),
         walk_errors,
         walk_error_count,
         unmeasurable_files: unmeasurable.load(Ordering::Relaxed),
@@ -1082,6 +1557,284 @@ mod tests {
         partial.consider(500, 0, || PathBuf::from("a"));
 
         assert!(partial.largest.is_empty());
+    }
+
+    fn child_dir(name: &str) -> Child {
+        Child {
+            is_dir: true,
+            is_file: false,
+            name_length: name.len(),
+        }
+    }
+
+    fn child_file(name: &str) -> Child {
+        Child {
+            is_dir: false,
+            is_file: true,
+            name_length: name.len(),
+        }
+    }
+
+    #[test]
+    fn subdirectory_counts_land_in_the_expected_fan_out_band() {
+        assert_eq!(classify_fan_out(0), FanOut::Leaf);
+        assert_eq!(classify_fan_out(1), FanOut::One);
+        assert_eq!(classify_fan_out(5), FanOut::From2To9);
+        assert_eq!(classify_fan_out(50), FanOut::From10To99);
+        assert_eq!(classify_fan_out(500), FanOut::From100To999);
+        assert_eq!(classify_fan_out(5000), FanOut::Over1000);
+    }
+
+    #[test]
+    fn fan_out_band_boundaries_do_not_overlap_or_leave_gaps() {
+        assert_eq!(classify_fan_out(1), FanOut::One);
+        assert_eq!(classify_fan_out(2), FanOut::From2To9);
+        assert_eq!(classify_fan_out(9), FanOut::From2To9);
+        assert_eq!(classify_fan_out(10), FanOut::From10To99);
+        assert_eq!(classify_fan_out(99), FanOut::From10To99);
+        assert_eq!(classify_fan_out(100), FanOut::From100To999);
+        assert_eq!(classify_fan_out(999), FanOut::From100To999);
+        assert_eq!(classify_fan_out(1000), FanOut::Over1000);
+    }
+
+    #[test]
+    fn file_counts_land_in_the_expected_band() {
+        assert_eq!(classify_file_count(0), FileCount::None);
+        assert_eq!(classify_file_count(5), FileCount::From1To9);
+        assert_eq!(classify_file_count(50), FileCount::From10To99);
+        assert_eq!(classify_file_count(500), FileCount::From100To999);
+        assert_eq!(classify_file_count(5000), FileCount::From1000To9999);
+        assert_eq!(classify_file_count(50_000), FileCount::Over10000);
+    }
+
+    #[test]
+    fn file_count_band_boundaries_do_not_overlap_or_leave_gaps() {
+        assert_eq!(classify_file_count(9), FileCount::From1To9);
+        assert_eq!(classify_file_count(10), FileCount::From10To99);
+        assert_eq!(classify_file_count(99), FileCount::From10To99);
+        assert_eq!(classify_file_count(100), FileCount::From100To999);
+        assert_eq!(classify_file_count(999), FileCount::From100To999);
+        assert_eq!(classify_file_count(1000), FileCount::From1000To9999);
+        assert_eq!(classify_file_count(9999), FileCount::From1000To9999);
+        assert_eq!(classify_file_count(10_000), FileCount::Over10000);
+    }
+
+    #[test]
+    fn a_directory_holding_no_subdirectories_is_a_leaf_not_an_empty_band() {
+        // "Holds nothing below it" is the single most common shape in a tree
+        // and the one the report is most often read for, so it gets its own
+        // name rather than being an unlabelled zero.
+        assert_eq!(classify_fan_out(0), FanOut::Leaf);
+        assert_eq!(FanOut::Leaf.label(), "none (leaf)");
+    }
+
+    #[test]
+    fn every_structure_band_has_a_label_and_a_distinct_slot() {
+        for band in FanOut::ALL {
+            assert!(!band.label().is_empty());
+            assert_eq!(FanOut::ALL[band.index()], band);
+        }
+        for band in FileCount::ALL {
+            assert!(!band.label().is_empty());
+            assert_eq!(FileCount::ALL[band.index()], band);
+        }
+    }
+
+    #[test]
+    fn a_directorys_children_are_counted_one_level_below_it() {
+        let counters = StructureCounters::new();
+        counters.record(
+            0,
+            0,
+            [child_dir("sub"), child_file("a.txt"), child_file("b.txt")],
+        );
+
+        let structure = counters.finish(true);
+
+        // Level 0 is the root itself; its children sit at level 1.
+        assert_eq!(
+            structure.level_rows(),
+            vec![
+                (
+                    0,
+                    DirectoryGroup {
+                        directories: 1,
+                        files: 0
+                    }
+                ),
+                (
+                    1,
+                    DirectoryGroup {
+                        directories: 1,
+                        files: 2
+                    }
+                ),
+            ]
+        );
+        assert_eq!(structure.deepest, 1);
+    }
+
+    #[test]
+    fn the_root_is_counted_as_a_directory_because_no_parent_lists_it() {
+        let counters = StructureCounters::new();
+        counters.record(0, 0, [child_dir("one"), child_dir("two")]);
+
+        let structure = counters.finish(true);
+
+        assert_eq!(structure.directories, 3);
+        assert_eq!(structure.listed_directories, 1);
+    }
+
+    #[test]
+    fn scanning_a_single_file_describes_no_structure_at_all() {
+        let counters = StructureCounters::new();
+
+        let structure = counters.finish(false);
+
+        assert_eq!(structure.directories, 0);
+        assert!(structure.level_rows().is_empty());
+    }
+
+    #[test]
+    fn directories_that_were_never_listed_are_reported_as_missing() {
+        // A directory stopped by the depth limit or by a permission failure is
+        // known to exist but has no known contents, so it is absent from the
+        // band tables and the shortfall has to be visible.
+        let counters = StructureCounters::new();
+        counters.record(0, 0, [child_dir("listed"), child_dir("blocked")]);
+        counters.record(1, 6, [child_file("a.txt")]);
+
+        let structure = counters.finish(true);
+
+        assert_eq!(structure.directories, 3);
+        assert_eq!(structure.listed_directories, 2);
+        assert_eq!(structure.unlisted_directories(), 1);
+    }
+
+    #[test]
+    fn entries_that_are_neither_a_file_nor_a_directory_are_counted_as_neither() {
+        // Symlinks are not followed, so counting one would either invent a
+        // directory or double-count the file it points at.
+        let counters = StructureCounters::new();
+        counters.record(
+            0,
+            0,
+            [
+                child_file("real.txt"),
+                Child {
+                    is_dir: false,
+                    is_file: false,
+                    name_length: 8,
+                },
+            ],
+        );
+
+        let structure = counters.finish(true);
+
+        assert_eq!(structure.files(), 1);
+        assert_eq!(structure.directories, 1);
+        // And they do not set the longest path either, or the longest path
+        // would name something absent from every other figure in the report.
+        assert_eq!(structure.longest_path, "real.txt".len());
+    }
+
+    #[test]
+    fn path_lengths_are_measured_below_the_root_not_from_it() {
+        // The prefix a tree currently sits under says nothing about the tree,
+        // and changes the moment it is copied somewhere else.
+        let counters = StructureCounters::new();
+        // "sub" is three characters below the root, so "sub/name.txt" is 12.
+        counters.record(1, 3, [child_file("name.txt")]);
+
+        assert_eq!(counters.finish(true).longest_path, 12);
+    }
+
+    #[test]
+    fn a_child_of_the_root_carries_no_leading_separator() {
+        let counters = StructureCounters::new();
+        counters.record(0, 0, [child_file("name.txt")]);
+
+        assert_eq!(counters.finish(true).longest_path, 8);
+    }
+
+    #[test]
+    fn paths_past_the_limit_are_counted_by_kind() {
+        let counters = StructureCounters::new();
+        let deep = LONG_PATH_LIMIT - 4;
+        counters.record(
+            1,
+            deep,
+            [
+                child_file("just-fits"),
+                child_dir("also-over"),
+                child_file("x"),
+            ],
+        );
+
+        let structure = counters.finish(true);
+
+        // deep + 1 separator + name: only the one-character name stays inside.
+        assert_eq!(structure.long_paths.files, 1);
+        assert_eq!(structure.long_paths.directories, 1);
+    }
+
+    #[test]
+    fn a_path_exactly_at_the_limit_is_not_over_it() {
+        let counters = StructureCounters::new();
+        counters.record(1, LONG_PATH_LIMIT - 2, [child_file("x")]);
+
+        let structure = counters.finish(true);
+
+        assert_eq!(structure.longest_path, LONG_PATH_LIMIT);
+        assert_eq!(structure.long_paths.files, 0);
+    }
+
+    #[test]
+    fn a_tree_deeper_than_the_tracked_levels_still_reports_its_depth() {
+        // The per-level counters are a fixed array so the walk threads never
+        // lock. Anything past it shares one row rather than being dropped.
+        let counters = StructureCounters::new();
+        counters.record(MAX_TRACKED_DEPTH + 5, 0, [child_file("buried.txt")]);
+
+        let structure = counters.finish(true);
+
+        assert_eq!(structure.deepest, MAX_TRACKED_DEPTH + 6);
+        assert_eq!(structure.beyond_tracked.files, 1);
+        assert!(structure
+            .level_rows()
+            .iter()
+            .all(|(depth, _)| *depth <= MAX_TRACKED_DEPTH));
+    }
+
+    #[test]
+    fn structure_rows_come_back_in_display_order_and_skip_empty_bands() {
+        let counters = StructureCounters::new();
+        counters.record(0, 0, []);
+        counters.record(1, 1, [child_file("a"), child_file("b")]);
+
+        let structure = counters.finish(true);
+
+        let fan_out: Vec<FanOut> = structure
+            .fan_out_rows()
+            .iter()
+            .map(|(band, _)| *band)
+            .collect();
+        let files: Vec<FileCount> = structure
+            .file_count_rows()
+            .iter()
+            .map(|(band, _)| *band)
+            .collect();
+
+        assert_eq!(fan_out, [FanOut::Leaf]);
+        assert_eq!(files, [FileCount::None, FileCount::From1To9]);
+    }
+
+    #[test]
+    fn the_mean_files_per_directory_guards_the_empty_case() {
+        let structure = Structure::default();
+
+        assert_eq!(structure.mean_files_per_directory(), 0.0);
+        assert!(structure.mean_files_per_directory().is_finite());
     }
 
     #[test]

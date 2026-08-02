@@ -1,6 +1,9 @@
 //! End-to-end tests for [`fast_walk::scan`] against real directory trees.
 
-use fast_walk::{scan, AgeBucket, Bucket, NoProgress, Scan, ScanOptions, SizeBand, NO_EXTENSION};
+use fast_walk::{
+    scan, AgeBucket, Bucket, DirectoryGroup, FanOut, FileCount, NoProgress, Scan, ScanOptions,
+    SizeBand, LONG_PATH_LIMIT, NO_EXTENSION,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -411,7 +414,249 @@ fn the_thread_count_changes_nothing_about_the_results() {
         assert_eq!(baseline.largest, other.largest, "{threads} threads");
         assert_eq!(baseline.hotspots, other.hotspots, "{threads} threads");
         assert_eq!(baseline.small_files, other.small_files, "{threads} threads");
+        assert_eq!(baseline.structure, other.structure, "{threads} threads");
     }
+}
+
+#[test]
+fn files_are_reported_at_the_level_they_sit_at() {
+    // Level 1 is the immediate children of the root, matching --max-depth, so
+    // a file directly in the root is at level 1 and not at level 0.
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "top.txt", 1);
+    write_file(dir.path(), "one/mid.txt", 1);
+    write_file(dir.path(), "one/two/deep.txt", 1);
+
+    let scan = scan_dir(dir.path());
+
+    assert_eq!(
+        scan.structure.level_rows(),
+        vec![
+            (
+                0,
+                DirectoryGroup {
+                    directories: 1,
+                    files: 0
+                }
+            ),
+            (
+                1,
+                DirectoryGroup {
+                    directories: 1,
+                    files: 1
+                }
+            ),
+            (
+                2,
+                DirectoryGroup {
+                    directories: 1,
+                    files: 1
+                }
+            ),
+            (
+                3,
+                DirectoryGroup {
+                    directories: 0,
+                    files: 1
+                }
+            ),
+        ]
+    );
+    assert_eq!(scan.structure.deepest, 3);
+    assert_eq!(scan.structure.directories, 3);
+}
+
+#[test]
+fn a_flat_share_and_a_deep_chain_are_told_apart() {
+    // The whole point of the report: the same file count laid out two ways
+    // behaves very differently to walk, back up and restore.
+    let flat = TempDir::new().unwrap();
+    for i in 0..20 {
+        write_file(flat.path(), &format!("f{i}.txt"), 1);
+    }
+
+    let chain = TempDir::new().unwrap();
+    let mut nested = String::new();
+    for i in 0..20 {
+        nested.push_str(&format!("d{i}/"));
+        write_file(chain.path(), &format!("{nested}f{i}.txt"), 1);
+    }
+
+    let flat = scan_dir(flat.path()).structure;
+    let chain = scan_dir(chain.path()).structure;
+
+    assert_eq!(flat.deepest, 1);
+    assert_eq!(flat.directories, 1);
+    assert_eq!(chain.deepest, 21);
+    assert_eq!(chain.directories, 21);
+
+    // A chain is every directory holding exactly one subdirectory; a flat
+    // share is one leaf holding everything.
+    assert_eq!(flat.fan_out[&FanOut::Leaf].directories, 1);
+    assert_eq!(chain.fan_out[&FanOut::One].directories, 20);
+    assert_eq!(chain.fan_out[&FanOut::Leaf].directories, 1);
+}
+
+#[test]
+fn empty_directories_are_counted_and_reported_as_holding_no_files() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("empty")).unwrap();
+    write_file(dir.path(), "full/a.txt", 1);
+
+    let structure = scan_dir(dir.path()).structure;
+
+    assert_eq!(structure.directories, 3);
+    assert_eq!(structure.listed_directories, 3);
+    // The root holds no files of its own either.
+    assert_eq!(structure.file_counts[&FileCount::None].directories, 2);
+    assert_eq!(structure.file_counts[&FileCount::From1To9].directories, 1);
+}
+
+#[test]
+fn directories_stopped_by_the_depth_limit_are_counted_but_reported_as_unlisted() {
+    // They are known to exist and unknown inside, so leaving them out of the
+    // total would understate the tree and counting them in the bands would
+    // claim knowledge the walk never had.
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "top.txt", 1);
+    write_file(dir.path(), "one/two/deep.txt", 1);
+
+    let structure = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            max_depth: 1,
+            ..ScanOptions::default()
+        },
+    )
+    .structure;
+
+    assert_eq!(structure.directories, 2);
+    assert_eq!(structure.listed_directories, 1);
+    assert_eq!(structure.unlisted_directories(), 1);
+}
+
+#[test]
+fn path_lengths_do_not_depend_on_where_the_tree_currently_sits() {
+    // The same tree under a longer prefix must measure the same, because the
+    // prefix will not survive a restore somewhere else.
+    let dir = TempDir::new().unwrap();
+    let build = |under: &str| {
+        let root = dir.path().join(under);
+        write_file(&root, "nested/directory/a-name.txt", 1);
+        scan_dir(&root).structure
+    };
+
+    let short = build("s");
+    let long = build("a-considerably-longer-directory-name");
+
+    assert_eq!(short.longest_path, long.longest_path);
+    assert_eq!(short.longest_path, "nested/directory/a-name.txt".len());
+}
+
+#[test]
+fn overlong_paths_are_counted_separately() {
+    let dir = TempDir::new().unwrap();
+    // Most filesystems cap a single name at 255, so the length has to be
+    // reached by nesting rather than by one very long name.
+    let deep = format!("{}/{}", "a".repeat(200), "b".repeat(50));
+    write_file(dir.path(), &format!("{deep}/over-the-limit.txt"), 1);
+    write_file(dir.path(), "short.txt", 1);
+
+    let structure = scan_dir(dir.path()).structure;
+
+    assert!(
+        structure.longest_path > LONG_PATH_LIMIT,
+        "fixture should exceed the limit: {}",
+        structure.longest_path
+    );
+    assert_eq!(structure.long_paths.files, 1);
+}
+
+#[test]
+fn skip_hidden_leaves_hidden_directories_out_of_the_structure_too() {
+    // The structure is counted from the same listings the totals come from, so
+    // the two must agree about what is in the tree.
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "visible/a.txt", 1);
+    write_file(dir.path(), ".hidden_dir/buried.txt", 1);
+
+    let counted = scan_dir(dir.path()).structure;
+    let skipped = scan_dir_with(
+        dir.path(),
+        ScanOptions {
+            skip_hidden: true,
+            ..ScanOptions::default()
+        },
+    )
+    .structure;
+
+    assert_eq!(counted.directories, 3);
+    assert_eq!(skipped.directories, 2);
+    assert_eq!(skipped.files(), 1);
+}
+
+#[test]
+fn scanning_a_single_file_reports_no_structure() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "alone.txt", 10);
+
+    let scan = scan(
+        &dir.path().join("alone.txt"),
+        &ScanOptions::default(),
+        &NoProgress,
+    )
+    .unwrap();
+
+    assert_eq!(scan.total_files(), 1);
+    assert_eq!(scan.structure.directories, 0);
+    assert!(scan.structure.level_rows().is_empty());
+}
+
+#[test]
+fn the_structure_accounts_for_every_file_and_directory_exactly_once() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "a.txt", 1);
+    write_file(dir.path(), "one/b.txt", 1);
+    write_file(dir.path(), "one/two/c.txt", 1);
+    fs::create_dir(dir.path().join("empty")).unwrap();
+
+    let structure = scan_dir(dir.path()).structure;
+
+    let by_level: u64 = structure
+        .level_rows()
+        .iter()
+        .map(|(_, group)| group.directories)
+        .sum();
+    let by_fan_out: u64 = structure
+        .fan_out_rows()
+        .iter()
+        .map(|(_, group)| group.directories)
+        .sum();
+    let by_file_count: u64 = structure
+        .file_count_rows()
+        .iter()
+        .map(|(_, group)| group.directories)
+        .sum();
+
+    assert_eq!(by_level, structure.directories);
+    assert_eq!(by_fan_out, structure.listed_directories);
+    assert_eq!(by_file_count, structure.listed_directories);
+    assert_eq!(structure.files(), scan_dir(dir.path()).total_files());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_directory_is_not_counted_as_a_directory() {
+    // Links are not followed, so counting one would invent a directory that
+    // the walk never descended into.
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "real/a.txt", 1);
+    std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+
+    let structure = scan_dir(dir.path()).structure;
+
+    assert_eq!(structure.directories, 2);
+    assert_eq!(structure.listed_directories, 2);
 }
 
 #[test]

@@ -56,6 +56,22 @@ running total per directory, so memory grows with directory count.
 age bands, size bands, largest files — is free, coming from the `stat` already
 performed.
 
+**The structure report is fed from `process_read_dir`, not from the per-file
+pass.** jwalk hands that callback one directory's whole listing at a time, on
+the walk threads, which is why the report costs nothing measurable: one update
+per directory into fixed counters, rather than per file into a growing map.
+Moving any of it into the measuring fold would turn a free report into a
+per-file one. The per-level counters are a fixed array so the walk threads never
+take a lock; levels past `MAX_TRACKED_DEPTH` share one labelled overflow row
+while the exact depth is still tracked. Interleaved measurement found no
+difference above run-to-run variance at up to 31,886 directories on local APFS;
+it has never been measured over SMB or NFS.
+
+**Structure path lengths exclude the scan root's prefix.** The number is meant
+to answer "will this tree fit under the restore target", and the prefix it
+currently sits under will not be there. A change making it absolute would look
+like a bug fix and would break that.
+
 **Sizes are apparent, not allocated.** Sparse files report their full length and
 hard links are counted once per name, so totals will not match `du`. This is
 deliberate and documented; do not "fix" it without reading
