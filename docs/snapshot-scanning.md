@@ -346,10 +346,20 @@ tracked in [TESTING.md](../TESTING.md) rather than repeated here, so that there
 is one list to keep honest instead of two that drift apart.
 
 The short version: the SMB path has been exercised against a Windows Server
-share and produces output identical to a local scan of the same tree. The NFS
-section has not been exercised against a NAS of any kind, and reaching a shadow
-copy through `snapshot=` was not achieved. If you run any of this somewhere new,
-a report is very welcome — see TESTING.md for how.
+share and produces output identical to a local scan of the same tree. Both
+protocols have also been run from inside the container built by the
+`Dockerfile`, against a Samba server and a Linux `nfsd`, again identical to a
+local scan — but that tests the client, not a NAS, and the NFS run was v4.2
+only. The NFS section has still not been exercised against a NAS of any kind,
+NFSv3 remains untested, and reaching a shadow copy through `snapshot=` was not
+achieved. If you run any of this somewhere new, a report is very welcome — see
+TESTING.md for how.
+
+If you do not have the mount helpers on the machine you are scanning from, the
+container image ships both. It needs `--cap-add SYS_ADMIN --cap-add
+DAC_READ_SEARCH` to mount anything; the second is what `mount.cifs` wants
+before it will apply its capability set. The mount commands themselves are the
+ones above, unchanged.
 
 ## A difference worth knowing about on Windows
 

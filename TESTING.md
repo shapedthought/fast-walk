@@ -22,11 +22,13 @@ still hold.
 | Local scan | macOS, APFS | — | Verified, standard fixture exact on both totals and on every documented expectation | 0.2.0 | 2026-08-02 |
 | Container scan, bind mount | Docker 29.6, Desktop on macOS, arm64 | — | Verified, standard fixture exact; not tried on a Linux host or on amd64 | 0.2.0 | 2026-08-02 |
 | SMB | Linux, cifs | Windows Server | Verified, byte identical to a local scan of the same tree | 0.2.0 | 2026-08-02 |
+| SMB | Container, cifs-utils | Samba 4.17 in a container | Verified, byte identical to a local scan across all six reports. Samba, not a NAS | 0.2.0 | 2026-08-02 |
 | SMB | macOS, smbfs | any | **Not tried** | | |
 | SMB | Windows | Windows Server | **Not tried** | | |
 | SMB shadow copy, `snapshot=` mount option | Linux, cifs | Windows Server | Partial: the option is accepted and the `@GMT` form is right, but no shadow copy was successfully reached | 0.2.0 | 2026-08-02 |
 | SMB shadow copy, `@GMT` path | Windows | Windows Server | **Not tried** | | |
 | NFS | Linux | Windows Server for NFS | Inconclusive: mounts over NFSv3, then every directory listing fails with an I/O error. A fact about that server rather than about fast-walk | 0.2.0 | 2026-08-02 |
+| NFS | Container, nfs-common | Linux `nfsd` in a container, NFSv4.2 | Verified, byte identical to a local scan across all six reports. Not a NAS, and v4 only | 0.2.0 | 2026-08-02 |
 | NFS | Linux | NetApp | **Not tried** | | |
 | NFS | Linux | ZFS or TrueNAS | **Not tried** | | |
 | `.snapshot` directory traversal | any | NetApp | **Not tried** | | |
@@ -38,9 +40,18 @@ output across all five reports, down to the byte.** Other people's results can
 reinforce or break that.
 
 That run predates the directory structure report, which was the sixth report to
-be added. Nothing about it is expected to differ over SMB — it is fed from the
-same directory listings as everything else — but that is reasoning, not a
-result, and the row above should not be read as covering it.
+be added, so it covers five. The container rows do cover all six: the same tree
+scanned locally, over SMB from a Samba server and over NFSv4.2 from a Linux
+`nfsd`, all three from inside the image built by the `Dockerfile`, produced
+byte identical CSVs for every report and the exact standard fixture totals.
+
+Read those two rows for what they are. They say the client side works — that
+`cifs-utils` and `nfs-common` in the image mount and read correctly, and that
+nothing in the reports is sensitive to the protocol. They say nothing about a
+NAS. Samba is not NetApp, a containerised `nfsd` is not a ZFS appliance, and
+the NFS row is NFSv4.2 only, so the NFSv3 path remains untested by anything
+except the inconclusive Windows Server for NFS run above. Snapshot directory
+traversal was not exercised by either.
 
 The macOS row covers a local APFS scan only, and it is narrower than it looks
 in one respect: **APFS refuses to create a file name that is not valid UTF-8**,

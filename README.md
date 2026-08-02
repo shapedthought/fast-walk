@@ -48,19 +48,63 @@ also leaves the results files owned by you rather than by root:
     docker run --rm --user "$(id -u):$(id -g)" \
         -v /srv/share:/scan:ro -v "$PWD":/out fast-walk -p /scan
 
+### Mounting a share inside the container
+
+The image carries `cifs-utils` and `nfs-common`, so a share can be mounted in
+the container rather than on the host. That means you do not need mount helpers
+on the machine you are running from, and the mount disappears when the
+container exits rather than being left behind.
+
+Mounting needs `CAP_SYS_ADMIN` for `mount` itself and `CAP_DAC_READ_SEARCH` for
+`mount.cifs`, which is setuid and gives up with `Unable to apply new capability
+set` without it. Those two are enough; `--privileged` is not required:
+
+    docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
+        -v "$PWD":/out -v "$PWD/.smbcred":/creds:ro \
+        --entrypoint bash fast-walk -c '
+            mkdir -p /scan
+            mount -t cifs //fileserver/data /scan -o ro,vers=3.0,credentials=/creds
+            fast-walk -p /scan'
+
+NFS is the same shape, with the mount options the docs recommend — `soft` in
+particular, so an unresponsive server fails visibly instead of hanging the scan
+forever:
+
+    docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
+        -v "$PWD":/out \
+        --entrypoint bash fast-walk -c '
+            mkdir -p /scan
+            mount -t nfs -o ro,soft,timeo=100,retrans=3 nas.example.com:/vol/data /scan
+            fast-walk -p /scan'
+
+The mount commands are the ones in
+[docs/snapshot-scanning.md](docs/snapshot-scanning.md), not a separate
+interface: everything that document says about credentials files, `vers=`,
+`soft` and confirming that `ro` actually took applies unchanged here. Read it
+before pointing this at a share you care about.
+
+### What has been checked
+
 Dependencies are built in their own layer, so editing the source and rebuilding
 does not recompile them: a cold build took 22.6 seconds here and a rebuild
 after a source change took 2.7, with only `fast-walk` itself recompiling. The
 Rust version is pinned in the `Dockerfile` rather than tracking `latest`, so it
 needs bumping deliberately.
 
-What has been checked, on Docker 29.6 with Docker Desktop on macOS and an
-arm64 image: the container scans the standard fixture to 20,232 files and
-1,435,762,672 bytes, matching the documented totals exactly; all six CSVs land
-in the mounted directory; `--cpus=2` is picked up correctly, so the thread
-default respects a container CPU limit rather than seeing the whole host; and a
-`--user` run produces the same totals with the output owned by the caller. The
-image has not been built or run on a Linux host, nor on amd64.
+On Docker 29.6 with Docker Desktop on macOS and an arm64 image: the container
+scans the standard fixture to 20,232 files and 1,435,762,672 bytes, matching
+the documented totals exactly; all six CSVs land in the mounted directory;
+`--cpus=2` is picked up correctly, so the thread default respects a container
+CPU limit rather than seeing the whole host; and a `--user` run produces the
+same totals with the output owned by the caller.
+
+The same fixture was then scanned three ways from inside this image — locally,
+over SMB from a Samba server, and over NFSv4.2 from a Linux `nfsd` — and all
+six CSVs came out byte identical every time. That exercises the client side
+only. A Samba container is not a NAS, the NFS run was v4.2 with no v3 path
+tested, and snapshot directory traversal was not exercised at all; see
+[TESTING.md](TESTING.md) for where the line sits. The image has not been built
+or run on a Linux host, nor on amd64.
 
 ## How to use
 
