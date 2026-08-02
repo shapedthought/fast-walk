@@ -71,6 +71,15 @@ while the exact depth is still tracked. Interleaved measurement found no
 difference above run-to-run variance at up to 31,886 directories on local APFS;
 it has never been measured over SMB or NFS.
 
+**Do not switch the Linux release to static musl.** It is the obvious way to
+stop worrying about glibc versions and it costs 4.6x: interleaved medians of 15
+pairs, 20,800 files over 5,621 directories, 10 threads, gave 25 ms for glibc
+against 114 ms for musl, ranges 25-27 and 105-131 with no overlap. musl's
+allocator is the reason, and this scan is concurrent and allocation-heavy by
+design. A different global allocator would probably fix it, but nobody has
+measured that, so it is not a plan yet. Measured on arm64 Linux in a container;
+not repeated on x86-64.
+
 **Structure path lengths exclude the scan root's prefix.** The number is meant
 to answer "will this tree fit under the restore target", and the prefix it
 currently sits under will not be there. A change making it absolute would look

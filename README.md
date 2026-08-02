@@ -14,6 +14,32 @@ cargo:
 
 The file will be in the target/release folder.
 
+## Download a binary
+
+Tagged releases carry prebuilt binaries for Linux (x86-64 and arm64), Windows
+(x86-64) and macOS (Intel and Apple silicon), each an archive holding the
+binary, the README, the LICENSE and TESTING.md. A `SHA256SUMS` file covers all
+of them, so one download can be checked with:
+
+    sha256sum -c SHA256SUMS --ignore-missing
+
+The Linux binaries are built on Ubuntu 22.04 and linked against its glibc. On
+an older distribution they may refuse to start, and the error will be about a
+missing `GLIBC_` version rather than anything to do with this tool. If that
+happens, use the container image or build from source; `objdump -T fast-walk |
+grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1` says which version it actually
+wants.
+
+There is deliberately **no static musl build**, which is the usual answer to
+that problem. musl's allocator is poor under the concurrent allocation this
+does, and it costs far more than the portability is worth: interleaved medians
+of 15 pairs on a tree of 20,800 files across 5,621 directories with 10 threads
+gave **25 ms for glibc against 114 ms for musl**, a 4.6x difference with no
+overlap between the ranges. If you need a static binary anyway, `cargo build
+--release --target x86_64-unknown-linux-musl` still produces one — just do not
+expect it to be quick, and measure it on your own tree before assuming these
+numbers transfer.
+
 ## Building with Docker
 
 If you would rather not install a toolchain, the `Dockerfile` builds it for

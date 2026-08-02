@@ -8,6 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Nothing here writes to the repository, so the token gets read access and
+# nothing else. Without this block the workflow inherits whatever the
+# repository default is, which for anything created before February 2023 is
+# read-write.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Test, lint and format
