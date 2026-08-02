@@ -33,6 +33,17 @@ build from source. To check any binary yourself:
 
     objdump -T fast-walk | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
 
+On macOS the binary is unsigned, so a browser download is quarantined and
+Gatekeeper refuses it with *"Apple could not verify fast-walk is free of
+malware"*. The binary does not run and prints nothing at all, which looks more
+alarming than it is. Clear the flag on the extracted binary:
+
+    xattr -d com.apple.quarantine fast-walk
+
+Downloading with `curl` or `gh release download` avoids it entirely, since
+neither sets the quarantine attribute in the first place. Signing this properly
+needs an Apple Developer ID, which the project does not have.
+
 There is deliberately **no static musl build**, which is the usual answer to
 that problem. musl's allocator is poor under the concurrent allocation this
 does, and it costs far more than the portability is worth: interleaved medians
