@@ -341,29 +341,15 @@ Mount options vary between kernel versions, distributions and NAS vendors, so
 check `man mount.cifs` and `man nfs` on the machine you are scanning from
 before running any of this against something you care about.
 
-Verified against a Windows Server share mounted over SMB from Linux:
+Which combinations have been run, and which are still only reasoned about, is
+tracked in [TESTING.md](../TESTING.md) rather than repeated here, so that there
+is one list to keep honest instead of two that drift apart.
 
-- The `mount -t cifs` command as written, including that `-o ro` is honoured
-- That a scan over SMB and a scan of the same tree locally on the server
-  produce identical output, down to the byte, across all five reports
-- That files carrying the Windows hidden attribute are counted over SMB just as
-  they are locally
-- The thread count and `actimeo` findings above
-
-Not verified, and written from documentation rather than practice:
-
-- Everything in the NFS section. An attempt was made against a Windows Server
-  NFS export, which reached a successful NFSv3 mount and then failed every
-  directory listing with `Input/output error`, surviving both `nordirplus` and
-  forcing the mount protocol to TCP, with nothing logged to `dmesg` to work
-  from. That says something about Windows Server for NFS and nothing about the
-  guidance here, which is written for NetApp and ZFS. The `nfs-common` and
-  `nfsvers` notes above did come out of it and are real.
-- Whether `snapshot=` actually mounts a shadow copy. The option is accepted:
-  passing an `@GMT` token that matched no shadow copy failed with `-2` rather
-  than being rejected as malformed, so the form is right. Reaching a real
-  shadow copy through it was not achieved.
-- Any of it over a high latency link
+The short version: the SMB path has been exercised against a Windows Server
+share and produces output identical to a local scan of the same tree. The NFS
+section has not been exercised against a NAS of any kind, and reaching a shadow
+copy through `snapshot=` was not achieved. If you run any of this somewhere new,
+a report is very welcome — see TESTING.md for how.
 
 ## A difference worth knowing about on Windows
 

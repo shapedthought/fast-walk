@@ -1,0 +1,129 @@
+name: Test report
+description: Report the result of running fast-walk against a filesystem, share or NAS
+title: "[test] "
+labels: ["test-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for running it somewhere new.
+
+        Results that did **not** work are as useful as ones that did — several
+        corrections so far came from failures rather than successes.
+
+        See [TESTING.md](../blob/master/TESTING.md) for what has already been
+        covered and what would help most.
+
+  - type: dropdown
+    id: outcome
+    attributes:
+      label: Outcome
+      options:
+        - Worked, and the numbers looked right
+        - Worked, but something about the output looked wrong
+        - Could not scan it at all
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: fast-walk version
+      description: Output of `fast-walk --version`.
+      placeholder: fast-walk 0.2.0
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: Client
+      description: The machine running fast-walk — OS and version.
+      placeholder: Ubuntu 24.04, kernel 6.8
+    validations:
+      required: true
+
+  - type: input
+    id: server
+    attributes:
+      label: Server or filesystem
+      description: >
+        What was scanned. For a local scan, the filesystem. For a share, the
+        server product and version — the vendor matters more than anything else
+        here.
+      placeholder: NetApp ONTAP 9.14 over NFSv3 / Windows Server 2022 over SMB / local ext4
+    validations:
+      required: true
+
+  - type: textarea
+    id: mount
+    attributes:
+      label: Mount command
+      description: >
+        For a network share, the exact mount command including options, plus
+        the matching line from `mount`. This is the single most useful field:
+        without it a result usually cannot be reproduced or explained. Redact
+        hostnames and credentials.
+      render: shell
+      placeholder: |
+        sudo mount -t cifs //server/share /mnt/share -o ro,vers=3.0,credentials=...
+        //server/share on /mnt/share type cifs (ro,relatime,vers=3.0,...)
+
+  - type: textarea
+    id: command
+    attributes:
+      label: fast-walk command and summary output
+      description: >
+        The command you ran and the summary lines it printed. The totals and
+        any warnings are the parts that matter; the tables are not needed.
+      render: shell
+      placeholder: |
+        $ fast-walk -p /mnt/share -o ~/scans/result
+        Using 8 threads
+        Total Files: 20232, Total Cap: 1369.25 MB, Average File: 69.3 KB
+    validations:
+      required: true
+
+  - type: dropdown
+    id: fixture
+    attributes:
+      label: Was this the standard fixture?
+      description: >
+        The generators in `scripts/` build a known tree of 20,232 files and
+        1,435,762,672 bytes. Using it makes a result directly comparable with
+        every other report.
+      options:
+        - "Yes, the standard fixture"
+        - "No, my own data"
+      default: 1
+    validations:
+      required: true
+
+  - type: textarea
+    id: comparison
+    attributes:
+      label: Compared against a local scan?
+      description: >
+        If you scanned the same tree both locally on the server and over the
+        network, paste the output of `fast-walk --diff local.csv remote.csv`.
+        "No extensions changed" is the result we are hoping for, and a
+        disagreement is the most valuable thing this project can be told.
+      render: shell
+
+  - type: textarea
+    id: surprises
+    attributes:
+      label: Anything surprising?
+      description: >
+        Warnings, counts that looked wrong, files you expected to be included
+        or excluded, timings that seemed off, or anything that took time to
+        work out. Rough notes are fine.
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have removed hostnames, credentials and anything else I would not want public
+          required: true
