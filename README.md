@@ -57,7 +57,34 @@ container exits rather than being left behind.
 
 Mounting needs `CAP_SYS_ADMIN` for `mount` itself and `CAP_DAC_READ_SEARCH` for
 `mount.cifs`, which is setuid and gives up with `Unable to apply new capability
-set` without it. Those two are enough; `--privileged` is not required:
+set` without it. Those two are enough; `--privileged` is not required.
+
+SMB needs credentials. Passing them as `-o user=...,password=...` puts the
+password in `ps` output and in your shell history, so `mount.cifs` reads them
+from a file instead. It is two lines, `username` and `password`, plus a
+`domain` line only if the server is domain joined — a wrong domain on a
+workgroup machine is rejected as an authentication failure, which sends you
+looking in the wrong place:
+
+    username=scanner
+    password=hunter2
+
+Write it without the password reaching your history, and lock it down.
+`chmod 600` is not optional: `mount.cifs` is being handed the file and anyone
+who can read it can read the password:
+
+    read -rp 'username: ' u && read -rsp 'password: ' p && echo
+    printf 'username=%s\npassword=%s\n' "$u" "$p" > .smbcred
+    chmod 600 .smbcred
+    unset u p
+
+That writes to the working directory, which is convenient and is also wherever
+you happen to be — quite possibly a checkout of something. `.smbcred` is in this
+repository's `.gitignore` and `.dockerignore`, but if you are working somewhere
+else, put it outside the tree or add it there too. Delete it when you are done.
+
+Then mount with `credentials=` pointing at where the file is mounted in the
+container, not at where it lives on the host:
 
     docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
         -v "$PWD":/out -v "$PWD/.smbcred":/creds:ro \
@@ -65,6 +92,14 @@ set` without it. Those two are enough; `--privileged` is not required:
             mkdir -p /scan
             mount -t cifs //fileserver/data /scan -o ro,vers=3.0,credentials=/creds
             fast-walk -p /scan'
+
+If the mount fails, the number in the message is the errno and is usually
+enough on its own: `mount error(13): Permission denied` is authentication, and
+`mount error(2): No such file or directory` is a share name that does not
+exist. `mount.cifs` will tell you to check `dmesg`, and the kernel's `CIFS:
+VFS:` lines do carry more, but the kernel log is not readable with the two
+capabilities above — add `--cap-add SYSLOG` when you need it. That is a
+difference from running on a host, where `dmesg` is simply there.
 
 NFS is the same shape, with the mount options the docs recommend — `soft` in
 particular, so an unresponsive server fails visibly instead of hanging the scan
