@@ -3,7 +3,7 @@ use comfy_table::modifiers::{UTF8_ROUND_CORNERS, UTF8_SOLID_INNER_BORDERS};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::*;
 use fast_walk::diff::{self, Diff};
-use fast_walk::{scan, Progress, Scan, ScanOptions};
+use fast_walk::{scan, Progress, Scan, ScanOptions, LONG_PATH_LIMIT, MAX_TRACKED_DEPTH};
 use indicatif::ProgressBar;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
@@ -373,6 +373,7 @@ fn run_scan(cli: &Cli, path: &Path) -> Result<()> {
     print_extension_table(&result, &written.extensions);
     print_age_table(&result);
     print_size_table(&result);
+    print_structure_tables(&result, written.structure.as_deref());
     print_hotspot_table(&result);
     print_largest_table(&result);
 
@@ -388,6 +389,7 @@ struct WrittenFiles {
     extensions: String,
     ages: String,
     sizes: String,
+    structure: Option<String>,
     hotspots: Option<String>,
     largest: Option<String>,
 }
@@ -399,6 +401,7 @@ impl WrittenFiles {
             self.ages.as_str(),
             self.sizes.as_str(),
         ];
+        files.extend(self.structure.as_deref());
         files.extend(self.hotspots.as_deref());
         files.extend(self.largest.as_deref());
         files
@@ -452,6 +455,8 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
     }
     wtr.flush()?;
 
+    let structure = write_structure_csv(result, stem)?;
+
     let hotspots = if result.hotspots.is_empty() {
         None
     } else {
@@ -500,9 +505,89 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
         extensions,
         ages,
         sizes,
+        structure,
         hotspots,
         largest,
     })
+}
+
+/// Write the structure report: how the tree is laid out, in counts only.
+///
+/// One file rather than one per distribution, in the long form of metric,
+/// band and counts, so that a tree can be described to someone without
+/// handing over a single directory name.
+fn write_structure_csv(result: &Scan, stem: &str) -> Result<Option<String>> {
+    let structure = &result.structure;
+
+    // Nothing to describe when the scan was pointed at a single file.
+    if structure.directories == 0 {
+        return Ok(None);
+    }
+
+    let path = format!("{}-structure.csv", stem);
+    let mut wtr = csv::Writer::from_path(&path).with_context(|| format!("cannot write {path}"))?;
+    wtr.write_record([
+        "Metric",
+        "Band",
+        "Directories",
+        "Pct Of Directories",
+        "Files",
+        "Pct Of Files",
+    ])?;
+
+    let all_directories = structure.directories;
+    let all_files = structure.files();
+    let mut row = |metric: &str, band: String, directories: u64, files: u64| {
+        wtr.write_record(&[
+            metric.to_string(),
+            band,
+            directories.to_string(),
+            format_share(directories, all_directories),
+            files.to_string(),
+            format_share(files, all_files),
+        ])
+    };
+
+    for (depth, group) in structure.level_rows() {
+        row("depth", depth.to_string(), group.directories, group.files)?;
+    }
+    if structure.beyond_tracked.directories + structure.beyond_tracked.files > 0 {
+        row(
+            "depth",
+            format!("deeper than {}", MAX_TRACKED_DEPTH),
+            structure.beyond_tracked.directories,
+            structure.beyond_tracked.files,
+        )?;
+    }
+
+    for (band, group) in structure.file_count_rows() {
+        row(
+            "files per directory",
+            band.label().to_string(),
+            group.directories,
+            group.files,
+        )?;
+    }
+
+    for (band, group) in structure.fan_out_rows() {
+        row(
+            "subdirectories per directory",
+            band.label().to_string(),
+            group.directories,
+            group.files,
+        )?;
+    }
+
+    row(
+        "path length",
+        format!("over {} characters below the root", LONG_PATH_LIMIT),
+        structure.long_paths.directories,
+        structure.long_paths.files,
+    )?;
+
+    wtr.flush()?;
+
+    Ok(Some(path))
 }
 
 fn print_extension_table(result: &Scan, csv_path: &str) {
@@ -586,6 +671,145 @@ fn print_size_table(result: &Scan) {
         format_size(result.small_at_or_below as f64),
         format_size(result.small_bytes as f64)
     );
+}
+
+/// Describe the layout of the tree without naming anything in it.
+///
+/// Deep nesting, one directory holding a hundred thousand files, and paths too
+/// long for the restore target are all things that decide how a backup
+/// behaves, and none of them show up in a total.
+fn print_structure_tables(result: &Scan, csv_path: Option<&str>) {
+    let structure = &result.structure;
+
+    // Nothing to describe when the scan was pointed at a single file.
+    if structure.directories == 0 {
+        return;
+    }
+
+    let all_directories = structure.directories;
+    let all_files = structure.files();
+
+    println!("\nDirectory structure");
+    println!(
+        "{} directories, deepest level {}, {:.1} files per directory on average",
+        all_directories,
+        structure.deepest,
+        structure.mean_files_per_directory()
+    );
+    println!(
+        "Longest path below the scan root: {} characters",
+        structure.longest_path
+    );
+
+    let long = structure.long_paths;
+    if long.directories + long.files > 0 {
+        println!(
+            "{} {} files and {} directories sit more than {} characters below the root",
+            "warning:".yellow(),
+            long.files,
+            long.directories,
+            LONG_PATH_LIMIT
+        );
+    }
+
+    if structure.unlisted_directories() > 0 {
+        println!(
+            "{} directories were never listed, so they are missing from the two band tables",
+            structure.unlisted_directories()
+        );
+    }
+
+    let levels = structure.level_rows();
+    let mut table = new_table(vec![
+        "Level",
+        "Directories",
+        "% of Dirs",
+        "Files",
+        "% of Files",
+    ]);
+    for (depth, group) in levels.iter().take(TABLE_ROWS) {
+        table.add_row(vec![
+            depth.to_string(),
+            group.directories.to_string(),
+            format_share(group.directories, all_directories),
+            group.files.to_string(),
+            format_share(group.files, all_files),
+        ]);
+    }
+    if structure.beyond_tracked.directories + structure.beyond_tracked.files > 0 {
+        table.add_row(vec![
+            format!("deeper than {}", MAX_TRACKED_DEPTH),
+            structure.beyond_tracked.directories.to_string(),
+            format_share(structure.beyond_tracked.directories, all_directories),
+            structure.beyond_tracked.files.to_string(),
+            format_share(structure.beyond_tracked.files, all_files),
+        ]);
+    }
+
+    println!("\nBy level, where level 1 is the immediate children of the scan root");
+    println!("{table}");
+    if let Some(csv_path) = csv_path {
+        report_truncation(levels.len().min(TABLE_ROWS), levels.len(), csv_path);
+    }
+
+    print_band_table(
+        "Files per directory",
+        "Files",
+        structure
+            .file_count_rows()
+            .iter()
+            .map(|(band, group)| (band.label(), *group))
+            .collect(),
+        all_directories,
+        all_files,
+    );
+
+    print_band_table(
+        "Subdirectories per directory",
+        "Subdirectories",
+        structure
+            .fan_out_rows()
+            .iter()
+            .map(|(band, group)| (band.label(), *group))
+            .collect(),
+        all_directories,
+        all_files,
+    );
+}
+
+/// One of the two per-directory distributions in the structure report. Both
+/// count the same directories, differing only in what they band them by.
+fn print_band_table(
+    heading: &str,
+    band_header: &str,
+    rows: Vec<(&str, fast_walk::DirectoryGroup)>,
+    all_directories: u64,
+    all_files: u64,
+) {
+    if rows.is_empty() {
+        return;
+    }
+
+    let mut table = new_table(vec![
+        band_header,
+        "Directories",
+        "% of Dirs",
+        "Files Held",
+        "% of Files",
+    ]);
+
+    for (label, group) in &rows {
+        table.add_row(vec![
+            (*label).to_string(),
+            group.directories.to_string(),
+            format_share(group.directories, all_directories),
+            group.files.to_string(),
+            format_share(group.files, all_files),
+        ]);
+    }
+
+    println!("\n{heading}");
+    println!("{table}");
 }
 
 fn print_hotspot_table(result: &Scan) {

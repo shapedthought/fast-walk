@@ -1,0 +1,13 @@
+# The build happens inside the image, so nothing built outside it belongs in
+# the context. target/ alone runs to hundreds of megabytes once it has been
+# used, and sending it costs more than the build.
+target/
+.git/
+.github/
+
+# Results from local runs, which follow these names by default.
+results-*.csv
+diff-*.csv
+
+Dockerfile
+.dockerignore

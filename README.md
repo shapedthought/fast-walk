@@ -14,6 +14,98 @@ cargo:
 
 The file will be in the target/release folder.
 
+## Building with Docker
+
+If you would rather not install a toolchain, the `Dockerfile` builds it for
+you:
+
+    docker build -t fast-walk .
+
+Scanning needs two mounts: the tree to look at, and somewhere for the results
+to land. The scan target can be read-only, since nothing is ever written to it:
+
+    docker run --rm -v /srv/share:/scan:ro -v "$PWD":/out fast-walk -p /scan
+
+Every option works as it does outside a container, so `-p /scan --skip-hidden
+-o monday` behaves the same way. The results go to the working directory, which
+is why `/out` is mounted; without it the CSVs are written inside the container
+and disappear with it.
+
+If the binary is what you actually want, take it and drop the image. It is a
+normal dynamically linked glibc binary, so it runs on any comparable Linux, not
+only inside a container:
+
+    docker create --name fw fast-walk
+    docker cp fw:/usr/local/bin/fast-walk .
+    docker rm fw
+
+**A container runs as root by default, and root bypasses permission bits.** For
+this tool that is not a detail: a scan as root reports files that the account
+running your backup may not be able to read, so the totals can come out higher
+than what will actually be protected. Pass `--user` to scan as yourself, which
+also leaves the results files owned by you rather than by root:
+
+    docker run --rm --user "$(id -u):$(id -g)" \
+        -v /srv/share:/scan:ro -v "$PWD":/out fast-walk -p /scan
+
+### Mounting a share inside the container
+
+The image carries `cifs-utils` and `nfs-common`, so a share can be mounted in
+the container rather than on the host. That means you do not need mount helpers
+on the machine you are running from, and the mount disappears when the
+container exits rather than being left behind.
+
+Mounting needs `CAP_SYS_ADMIN` for `mount` itself and `CAP_DAC_READ_SEARCH` for
+`mount.cifs`, which is setuid and gives up with `Unable to apply new capability
+set` without it. Those two are enough; `--privileged` is not required:
+
+    docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
+        -v "$PWD":/out -v "$PWD/.smbcred":/creds:ro \
+        --entrypoint bash fast-walk -c '
+            mkdir -p /scan
+            mount -t cifs //fileserver/data /scan -o ro,vers=3.0,credentials=/creds
+            fast-walk -p /scan'
+
+NFS is the same shape, with the mount options the docs recommend — `soft` in
+particular, so an unresponsive server fails visibly instead of hanging the scan
+forever:
+
+    docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
+        -v "$PWD":/out \
+        --entrypoint bash fast-walk -c '
+            mkdir -p /scan
+            mount -t nfs -o ro,soft,timeo=100,retrans=3 nas.example.com:/vol/data /scan
+            fast-walk -p /scan'
+
+The mount commands are the ones in
+[docs/snapshot-scanning.md](docs/snapshot-scanning.md), not a separate
+interface: everything that document says about credentials files, `vers=`,
+`soft` and confirming that `ro` actually took applies unchanged here. Read it
+before pointing this at a share you care about.
+
+### What has been checked
+
+Dependencies are built in their own layer, so editing the source and rebuilding
+does not recompile them: a cold build took 22.6 seconds here and a rebuild
+after a source change took 2.7, with only `fast-walk` itself recompiling. The
+Rust version is pinned in the `Dockerfile` rather than tracking `latest`, so it
+needs bumping deliberately.
+
+On Docker 29.6 with Docker Desktop on macOS and an arm64 image: the container
+scans the standard fixture to 20,232 files and 1,435,762,672 bytes, matching
+the documented totals exactly; all six CSVs land in the mounted directory;
+`--cpus=2` is picked up correctly, so the thread default respects a container
+CPU limit rather than seeing the whole host; and a `--user` run produces the
+same totals with the output owned by the caller.
+
+The same fixture was then scanned three ways from inside this image — locally,
+over SMB from a Samba server, and over NFSv4.2 from a Linux `nfsd` — and all
+six CSVs came out byte identical every time. That exercises the client side
+only. A Samba container is not a NAS, the NFS run was v4.2 with no v3 path
+tested, and snapshot directory traversal was not exercised at all; see
+[TESTING.md](TESTING.md) for where the line sits. The image has not been built
+or run on a Linux host, nor on amd64.
+
 ## How to use
 
 Run app in terminal.
@@ -86,15 +178,16 @@ file sizes are usually far below a megabyte.
 
 ### Where the results go
 
-A scan writes five CSVs, sharing one name stem. By default the stem is a UTC
+A scan writes six CSVs, sharing one name stem. By default the stem is a UTC
 timestamp, so a series of scans sorts chronologically and one run never
 overwrites another:
 
-    results-20260801-160000.csv           totals per extension
-    results-20260801-160000-age.csv       totals per age band
-    results-20260801-160000-size.csv      totals per size band
-    results-20260801-160000-hotspots.csv  directories holding the most small files
-    results-20260801-160000-largest.csv   the largest files found
+    results-20260801-160000.csv            totals per extension
+    results-20260801-160000-age.csv        totals per age band
+    results-20260801-160000-size.csv       totals per size band
+    results-20260801-160000-structure.csv  how the tree is laid out
+    results-20260801-160000-hotspots.csv   directories holding the most small files
+    results-20260801-160000-largest.csv    the largest files found
 
 `--output` sets the stem instead, which is what you want when something else
 has to find the files afterwards:
@@ -104,6 +197,7 @@ has to find the files afterwards:
     monday.csv
     monday-age.csv
     monday-size.csv
+    monday-structure.csv
     monday-hotspots.csv
     monday-largest.csv
 
@@ -159,6 +253,74 @@ Here 96% of the files hold 11% of the data. The bands are deliberately fine at
 the bottom of the range and coarse at the top, because that is where the
 difference in backup time lives. Empty files get their own band since they are
 pure per-file overhead with no payload at all.
+
+### Directory structure
+
+Two shares holding the same files can behave completely differently depending
+on how those files are arranged. A million files in one directory, a tree
+twenty levels deep, and paths too long for the restore target are all things
+that decide how a backup runs and none of them show up in a total.
+
+This report describes the layout in counts and lengths only. It names nothing,
+so it can be pasted into a ticket or sent to a vendor without disclosing a
+single directory name:
+
+    Directory structure
+    605 directories, deepest level 7, 5.9 files per directory on average
+    Longest path below the scan root: 123 characters
+
+    By level, where level 1 is the immediate children of the scan root
+    ╭───────┬─────────────┬───────────┬───────┬────────────╮
+    │ Level │ Directories │ % of Dirs │ Files │ % of Files │
+    ╞═══════╪═════════════╪═══════════╪═══════╪════════════╡
+    │ 0     │ 1           │ 0.2%      │ 0     │ 0.0%       │
+    │ 1     │ 8           │ 1.3%      │ 8     │ 0.2%       │
+    │ 2     │ 10          │ 1.7%      │ 19    │ 0.5%       │
+    │ 3     │ 68          │ 11.2%     │ 26    │ 0.7%       │
+    │ 4     │ 447         │ 73.9%     │ 1323  │ 36.9%      │
+    │ 5     │ 70          │ 11.6%     │ 1605  │ 44.8%      │
+    │ 6     │ 1           │ 0.2%      │ 599   │ 16.7%      │
+    │ 7     │ 0           │ 0.0%      │ 1     │ 0.0%       │
+    ╰───────┴─────────────┴───────────┴───────┴────────────╯
+
+    Files per directory
+    ╭──────────────┬─────────────┬───────────┬────────────┬────────────╮
+    │ Files        │ Directories │ % of Dirs │ Files Held │ % of Files │
+    ╞══════════════╪═════════════╪═══════════╪════════════╪════════════╡
+    │ none         │ 46          │ 7.6%      │ 0          │ 0.0%       │
+    │ 1 to 9       │ 554         │ 91.6%     │ 1798       │ 50.2%      │
+    │ 10 to 99     │ 1           │ 0.2%      │ 14         │ 0.4%       │
+    │ 100 to 999   │ 3           │ 0.5%      │ 520        │ 14.5%      │
+    │ 1000 to 9999 │ 1           │ 0.2%      │ 1249       │ 34.9%      │
+    ╰──────────────┴─────────────┴───────────┴────────────┴────────────╯
+
+A third table bands directories by how many subdirectories they hold, which is
+what separates a wide tree from a long chain: a share where almost every
+directory is a leaf is flat, and one where almost every directory holds exactly
+one subdirectory is a chain.
+
+Level 1 is the immediate children of the scan root, matching `--max-depth`, so
+a file sitting directly in the root is at level 1. Files count at the level
+they sit at; in the band tables they count towards the directory holding them.
+
+Path lengths are measured **below the scan root**, excluding the prefix the
+tree currently sits under, because that prefix does not survive being copied or
+restored somewhere else. Anything longer than 260 characters is counted and
+called out, since that is where backup agents on Windows start to fail. Add the
+length of the destination prefix to judge whether a restore will fit.
+
+Directories that were counted but never listed — stopped by `--max-depth` or by
+a permission failure — are reported as such and left out of the two band
+tables, since their contents are unknown rather than empty.
+
+Unlike the hotspot report, this one is free: the counts come from the directory
+listing the walk already performs, one update per directory rather than per
+file, into a fixed set of counters that do not grow with the tree. Interleaved
+runs on macOS 15 with a local APFS disk and 10 threads showed no difference
+that rose above run-to-run variance, on trees of 20,232 files over 17
+directories, 20,800 files over 5,621 directories, and 30,625 files over 31,886
+directories. It has not been measured over SMB or NFS, nor on trees with
+hundreds of thousands of directories.
 
 ### Small-file hotspots
 
