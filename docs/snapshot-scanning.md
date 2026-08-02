@@ -101,12 +101,22 @@ Where the snapshots live depends on the server:
 | ZFS | `<mountpoint>/.zfs/snapshot/<name>` |
 | LVM and similar | mount the snapshot device separately |
 
+You need the `mount.nfs` helper, which comes from `nfs-common` on Debian and
+Ubuntu or `nfs-utils` on RHEL and Fedora. Without it, `mount` falls back to the
+raw system call and rejects options it cannot parse, reporting them as bad
+options rather than as a missing package:
+
+```sh
+sudo apt install nfs-common
+```
+
 Mount read-only:
 
 ```sh
 sudo mkdir -p /mnt/snapshot
 sudo mount -t nfs -o ro,soft,timeo=100,retrans=3 \
     nas.example.com:/vol/data /mnt/snapshot
+mount | grep nfs                   # confirm ro and the version actually took
 ```
 
 `soft` is deliberate. With the default `hard`, a server that stops responding
@@ -114,7 +124,12 @@ leaves the scan hung indefinitely and unkillable; with `soft` the operation
 fails, the failure surfaces as a `fast-walk` warning, and you know the totals
 are incomplete. Soft mounts are the wrong default for read-write workloads that
 can lose data, but a read-only scan cannot corrupt anything — the worst case is
-a visibly incomplete result.
+a visibly incomplete result. The trade is that a soft mount reports failures as
+a generic `Input/output error`, so when something goes wrong the real cause has
+to come from `dmesg` or the server rather than from `errno`.
+
+Pin `nfsvers=3` if the server is not a Unix NAS. Modern Linux negotiates NFSv4
+by default, which several implementations handle differently or not at all.
 
 Then scan the snapshot directly, rather than the live tree:
 
@@ -183,16 +198,38 @@ as an authentication failure. If the mount fails, `sudo dmesg | tail` carries
 the real reason: `-2` is a share name that does not exist, `-13` is
 authentication.
 
-Recent kernels accept a `snapshot=` mount option to mount a specific shadow
-copy directly. Where that is unavailable, address the `@GMT` path itself. The
-token has to be given exactly — shadow copies generally do not appear in a
-normal directory listing of the parent, so you cannot discover them by browsing:
+Reaching a specific shadow copy works differently on the two clients.
+
+From Linux, use the `snapshot=` mount option. Addressing an `@GMT` path under
+an ordinary mount does not work: path level `@GMT` traversal is a feature of
+the Windows SMB client, and `snapshot=` is what the Linux client provides
+instead.
 
 ```sh
-fast-walk -p '/mnt/snapshot/@GMT-2026.08.01-02.00.00' -t 4 -o ~/scans/nightly
+sudo mount -t cifs //fileserver/data /mnt/snapshot \
+    -o ro,vers=3.0,credentials=/root/.smbcred,snapshot=@GMT-2026.08.01-02.00.00
+fast-walk -p /mnt/snapshot -o ~/scans/nightly
 ```
 
-Or from Windows, against the share directly:
+The token has to be exact, and it is in **UTC** while `vssadmin list shadows`
+prints local time. Converting by hand invites an off by one timezone; ask the
+server for it already converted:
+
+```powershell
+Get-CimInstance Win32_ShadowCopy | ForEach-Object {
+    '@GMT-{0:yyyy.MM.dd-HH.mm.ss}' -f $_.InstallDate.ToUniversalTime()
+}
+```
+
+A token that does not match a shadow copy fails the mount with `-2` in
+`dmesg`, which reads like a missing share and is easy to misdiagnose. A `-22`
+there would mean the option itself was rejected, so the two are worth telling
+apart.
+
+Shadow copies do not appear in a normal directory listing of the parent, so
+there is no browsing your way to the name.
+
+From Windows, address the `@GMT` path directly against the share:
 
 ```powershell
 fast-walk.exe -p "\\fileserver\data\@GMT-2026.08.01-02.00.00" -t 4 -o $HOME\scans\nightly
@@ -304,20 +341,15 @@ Mount options vary between kernel versions, distributions and NAS vendors, so
 check `man mount.cifs` and `man nfs` on the machine you are scanning from
 before running any of this against something you care about.
 
-Verified against a Windows Server share mounted over SMB from Linux:
+Which combinations have been run, and which are still only reasoned about, is
+tracked in [TESTING.md](../TESTING.md) rather than repeated here, so that there
+is one list to keep honest instead of two that drift apart.
 
-- The `mount -t cifs` command as written, including that `-o ro` is honoured
-- That a scan over SMB and a scan of the same tree locally on the server
-  produce identical output, down to the byte, across all five reports
-- That files carrying the Windows hidden attribute are counted over SMB just as
-  they are locally
-- The thread count and `actimeo` findings above
-
-Not verified, and written from documentation rather than practice:
-
-- Everything in the NFS section
-- The `snapshot=` mount option
-- Any of it over a high latency link
+The short version: the SMB path has been exercised against a Windows Server
+share and produces output identical to a local scan of the same tree. The NFS
+section has not been exercised against a NAS of any kind, and reaching a shadow
+copy through `snapshot=` was not achieved. If you run any of this somewhere new,
+a report is very welcome — see TESTING.md for how.
 
 ## A difference worth knowing about on Windows
 

@@ -62,6 +62,12 @@ A scan over SMB has been checked against a scan of the same tree taken locally
 on the server, and the two produce identical output. The `actimeo` mount option
 matters more than the thread count for large shares; both are covered there.
 
+Which transports and servers have actually been run against, and which are still
+only reasoned about, is tracked in [TESTING.md](TESTING.md). NAS appliances
+cannot be reproduced in CI, so results from other people's hardware are the only
+way that list gets shorter — reports are very welcome, including ones where it
+did not work.
+
 ## Output
 
 Tools outputs a CSV of the extensions arranged by quantity, also includes total capacity in bytes.

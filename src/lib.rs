@@ -4,7 +4,7 @@
 //! aggregation here means both can be exercised without going through the
 //! terminal output or the CSV writer.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use jwalk::{Parallelism, WalkDir};
 use rayon::prelude::*;
 use std::cmp::{Ordering as CmpOrdering, Reverse};
@@ -546,6 +546,9 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
 
     let mut walk_errors: Vec<String> = Vec::new();
     let mut walk_error_count = 0u64;
+    // Set if the scanned directory itself could not be listed, as opposed to
+    // one below it. That is not a partial result, it is no result.
+    let mut root_unreadable: Option<String> = None;
 
     let files: Vec<_> = WalkDir::new(path)
         .sort(true)
@@ -564,6 +567,14 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
                 // entry, with the failure recorded on the entry itself. Its
                 // contents are missing from the totals, so report it.
                 if let Some(err) = &entry.read_children_error {
+                    if entry.depth() == 0 {
+                        // The io error alone; jwalk's own message repeats the
+                        // path, which the caller is about to print anyway.
+                        root_unreadable = Some(match err.io_error() {
+                            Some(io) => io.to_string(),
+                            None => err.to_string(),
+                        });
+                    }
                     if walk_errors.len() < MAX_REPORTED_ERRORS {
                         walk_errors.push(err.to_string());
                     }
@@ -581,6 +592,14 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
         })
         .filter(|entry| entry.file_type().is_file())
         .collect();
+
+    // A directory below the root failing leaves a partial result worth
+    // reporting. The root itself failing leaves nothing, and returning zero
+    // files with a warning would be indistinguishable from an empty directory
+    // to anything reading the exit status.
+    if let Some(err) = root_unreadable {
+        bail!("cannot list {}: {}", path.display(), err);
+    }
 
     progress.files_listed(files.len() as u64);
 
