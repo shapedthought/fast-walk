@@ -1,12 +1,11 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use comfy_table::modifiers::{UTF8_ROUND_CORNERS, UTF8_SOLID_INNER_BORDERS};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::*;
 use fast_walk::diff::{self, Diff};
 use fast_walk::{scan, Progress, Scan, ScanOptions};
 use std::sync::OnceLock;
-use std::time::Instant;
-use randomizer::Randomizer;
+use std::time::{Instant, SystemTime};
 use indicatif::ProgressBar;
 
 
@@ -68,6 +67,75 @@ fn colour_delta(text: String, delta: i64) -> ColoredString {
         d if d < 0 => text.red(),
         _ => text.normal(),
     }
+}
+
+/// Convert a count of days since 1970-01-01 into a calendar date.
+///
+/// Howard Hinnant's `civil_from_days`, which avoids pulling in a date library
+/// for the one place a date is needed.
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let day_of_era = (shifted - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// A sortable UTC timestamp, used to name results files.
+///
+/// UTC rather than local time so that a series of scans sorts correctly and
+/// reads the same wherever it is looked at.
+fn timestamp(now: SystemTime) -> String {
+    let seconds = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let time_of_day = seconds % 86_400;
+
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        year,
+        month,
+        day,
+        time_of_day / 3600,
+        (time_of_day % 3600) / 60,
+        time_of_day % 60
+    )
+}
+
+/// Work out the base name for the results files.
+///
+/// A `.csv` extension on `--output` is dropped so the per-report suffixes
+/// attach to the name rather than after the extension.
+fn output_stem(output: Option<&Path>, now: SystemTime, prefix: &str) -> Result<String> {
+    let Some(output) = output else {
+        return Ok(format!("{}-{}", prefix, timestamp(now)));
+    };
+
+    let given = output.to_string_lossy();
+    let stem = match given.len().checked_sub(4) {
+        Some(cut) if given[cut..].eq_ignore_ascii_case(".csv") => &given[..cut],
+        _ => given.as_ref(),
+    };
+
+    if stem.is_empty() {
+        bail!("--output needs a file name, not just an extension");
+    }
+
+    Ok(stem.to_string())
 }
 
 /// Parse a size written as a plain byte count or with a K, M or G suffix, so
@@ -158,6 +226,11 @@ struct Cli {
     #[clap(long, num_args = 2, value_names = ["OLD", "NEW"], value_parser)]
     diff: Option<Vec<PathBuf>>,
 
+    /// Base name for the results files. A .csv extension is optional, and the
+    /// per-report suffixes are added to the name. Defaults to a timestamp.
+    #[clap(short, long, value_parser, value_name = "PATH")]
+    output: Option<PathBuf>,
+
 }
 
 /// Drives an `indicatif` bar. The bar cannot be built until the walk reports
@@ -212,7 +285,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(files) = &cli.diff {
-        return run_diff(&files[0], &files[1]);
+        return run_diff(&files[0], &files[1], cli.output.as_deref());
     }
 
     let path = cli
@@ -254,7 +327,7 @@ fn run_scan(cli: &Cli, path: &Path) -> Result<()> {
         eprintln!("{} {}", "warning:".yellow(), err);
     }
 
-    let stem = format!("results-{}", Randomizer::ALPHANUMERIC(6).string().unwrap());
+    let stem = output_stem(cli.output.as_deref(), SystemTime::now(), "results")?;
     let written = write_scan_csvs(&result, &stem)?;
 
     let total_files = result.total_files();
@@ -325,7 +398,8 @@ impl WrittenFiles {
 
 fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
     let extensions = format!("{}.csv", stem);
-    let mut wtr = csv::Writer::from_path(&extensions)?;
+    let mut wtr = csv::Writer::from_path(&extensions)
+        .with_context(|| format!("cannot write {}", extensions))?;
     wtr.write_record(["Extension", "Qty", "Cap Bytes", "Avg Bytes"])?;
     for (extension, bucket) in result.rows() {
         wtr.write_record(&[
@@ -339,7 +413,7 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
 
     let total_cap = result.total_bytes();
     let ages = format!("{}-age.csv", stem);
-    let mut wtr = csv::Writer::from_path(&ages)?;
+    let mut wtr = csv::Writer::from_path(&ages).with_context(|| format!("cannot write {}", ages))?;
     wtr.write_record(["Age", "Qty", "Cap Bytes", "Avg Bytes", "Pct Of Cap"])?;
     for (age, bucket) in result.age_rows() {
         wtr.write_record(&[
@@ -354,7 +428,7 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
 
     let total_files = result.total_files();
     let sizes = format!("{}-size.csv", stem);
-    let mut wtr = csv::Writer::from_path(&sizes)?;
+    let mut wtr = csv::Writer::from_path(&sizes).with_context(|| format!("cannot write {}", sizes))?;
     wtr.write_record(["Size", "Qty", "Pct Of Files", "Cap Bytes", "Pct Of Cap"])?;
     for (band, bucket) in result.size_rows() {
         wtr.write_record(&[
@@ -371,7 +445,7 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
         None
     } else {
         let path = format!("{}-hotspots.csv", stem);
-        let mut wtr = csv::Writer::from_path(&path)?;
+        let mut wtr = csv::Writer::from_path(&path).with_context(|| format!("cannot write {path}"))?;
         wtr.write_record([
             "Directory",
             "Files",
@@ -400,7 +474,7 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
         None
     } else {
         let path = format!("{}-largest.csv", stem);
-        let mut wtr = csv::Writer::from_path(&path)?;
+        let mut wtr = csv::Writer::from_path(&path).with_context(|| format!("cannot write {path}"))?;
         wtr.write_record(["Bytes", "Path"])?;
         for file in &result.largest {
             wtr.write_record(&[file.bytes.to_string(), file.path.display().to_string()])?;
@@ -545,7 +619,7 @@ fn print_largest_table(result: &Scan) {
     println!("{table}");
 }
 
-fn run_diff(before_path: &Path, after_path: &Path) -> Result<()> {
+fn run_diff(before_path: &Path, after_path: &Path, output: Option<&Path>) -> Result<()> {
     let before = diff::read_scan_csv(before_path)?;
     let after = diff::read_scan_csv(after_path)?;
 
@@ -557,7 +631,10 @@ fn run_diff(before_path: &Path, after_path: &Path) -> Result<()> {
         after_path.display()
     );
 
-    let file_name = format!("diff-{}.csv", Randomizer::ALPHANUMERIC(6).string().unwrap());
+    let file_name = format!(
+        "{}.csv",
+        output_stem(output, SystemTime::now(), "diff")?
+    );
     write_diff_csv(&result, &file_name)?;
 
     println!(
@@ -620,7 +697,8 @@ fn run_diff(before_path: &Path, after_path: &Path) -> Result<()> {
 }
 
 fn write_diff_csv(result: &Diff, path: &str) -> Result<()> {
-    let mut wtr = csv::Writer::from_path(path)?;
+    let mut wtr =
+        csv::Writer::from_path(path).with_context(|| format!("cannot write {path}"))?;
     wtr.write_record([
         "Extension",
         "Qty Before",
@@ -708,6 +786,97 @@ mod tests {
     #[test]
     fn a_share_of_an_empty_scan_is_zero_not_a_division_by_zero() {
         assert_eq!(format_share(0, 0), "0.0%");
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn timestamps_are_utc_calendar_dates() {
+        assert_eq!(timestamp(at(0)), "19700101-000000");
+        assert_eq!(timestamp(at(1_785_600_000)), "20260801-160000");
+        assert_eq!(timestamp(at(1_767_225_599)), "20251231-235959");
+    }
+
+    #[test]
+    fn leap_days_are_handled() {
+        // 2000 is a leap year despite being a century.
+        assert_eq!(timestamp(at(951_782_400)), "20000229-000000");
+    }
+
+    #[test]
+    fn timestamps_sort_in_chronological_order() {
+        // The whole point of the format: a directory listing is a history.
+        let mut stamps = [
+            timestamp(at(1_785_600_000)),
+            timestamp(at(0)),
+            timestamp(at(951_782_400)),
+        ];
+        let expected = [
+            timestamp(at(0)),
+            timestamp(at(951_782_400)),
+            timestamp(at(1_785_600_000)),
+        ];
+        stamps.sort();
+
+        assert_eq!(stamps, expected);
+    }
+
+    #[test]
+    fn without_an_output_the_stem_is_the_prefix_and_a_timestamp() {
+        assert_eq!(
+            output_stem(None, at(1_785_600_000), "results").unwrap(),
+            "results-20260801-160000"
+        );
+        assert_eq!(
+            output_stem(None, at(1_785_600_000), "diff").unwrap(),
+            "diff-20260801-160000"
+        );
+    }
+
+    #[test]
+    fn an_output_name_is_used_as_given() {
+        let stem = output_stem(Some(Path::new("monday")), at(0), "results").unwrap();
+
+        assert_eq!(stem, "monday");
+    }
+
+    #[test]
+    fn a_csv_extension_on_the_output_is_dropped_so_suffixes_attach_to_the_name() {
+        // Otherwise `-o monday.csv` would produce `monday.csv-age.csv`.
+        assert_eq!(
+            output_stem(Some(Path::new("monday.csv")), at(0), "results").unwrap(),
+            "monday"
+        );
+        assert_eq!(
+            output_stem(Some(Path::new("monday.CSV")), at(0), "results").unwrap(),
+            "monday"
+        );
+    }
+
+    #[test]
+    fn a_directory_in_the_output_path_is_preserved() {
+        let stem = output_stem(Some(Path::new("/var/scans/monday.csv")), at(0), "results").unwrap();
+
+        assert_eq!(stem, "/var/scans/monday");
+    }
+
+    #[test]
+    fn only_a_csv_extension_is_stripped() {
+        assert_eq!(
+            output_stem(Some(Path::new("monday.txt")), at(0), "results").unwrap(),
+            "monday.txt"
+        );
+        assert_eq!(
+            output_stem(Some(Path::new("scan.2026")), at(0), "results").unwrap(),
+            "scan.2026"
+        );
+    }
+
+    #[test]
+    fn an_output_of_only_an_extension_is_rejected() {
+        assert!(output_stem(Some(Path::new(".csv")), at(0), "results").is_err());
     }
 
     #[test]

@@ -101,36 +101,23 @@ fn an_empty_results_file_compares_as_having_nothing() {
     assert_eq!(diff.bytes_delta(), 300);
 }
 
-/// Scan a directory with the real binary and return the extensions CSV it
-/// wrote. Output lands in `working`, since the tool writes to the current
-/// directory.
-fn scan_to_csv(tree: &Path, working: &Path) -> PathBuf {
+/// Scan a directory with the real binary, naming the output, and return the
+/// extensions CSV it wrote.
+fn scan_to_csv(tree: &Path, working: &Path, name: &str) -> PathBuf {
+    let stem = working.join(name);
+
     let status = Command::new(env!("CARGO_BIN_EXE_fast-walk"))
         .arg("-p")
         .arg(tree)
-        .current_dir(working)
+        .arg("-o")
+        .arg(&stem)
         .status()
         .unwrap();
     assert!(status.success(), "scan failed");
 
-    let mut results: Vec<PathBuf> = fs::read_dir(working)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            // The extensions CSV is `results-<stem>.csv`; every other report
-            // adds a suffix after the stem. Matching that shape rather than
-            // excluding known suffixes keeps this working as reports are added.
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            match name.strip_prefix("results-").and_then(|rest| rest.strip_suffix(".csv")) {
-                Some(stem) => !stem.contains('-'),
-                None => false,
-            }
-        })
-        .collect();
-
-    assert_eq!(results.len(), 1, "expected one extensions CSV: {results:?}");
-    results.pop().unwrap()
+    let csv = stem.with_extension("csv");
+    assert!(csv.is_file(), "{} was not written", csv.display());
+    csv
 }
 
 #[test]
@@ -146,10 +133,9 @@ fn a_scan_writes_csvs_that_the_differ_can_read_back() {
     fs::write(after_tree.path().join("b.txt"), vec![b'x'; 400]).unwrap();
     fs::write(after_tree.path().join("c.mp4"), vec![b'x'; 1000]).unwrap();
 
-    let before_out = TempDir::new().unwrap();
-    let after_out = TempDir::new().unwrap();
-    let before = scan_to_csv(before_tree.path(), before_out.path());
-    let after = scan_to_csv(after_tree.path(), after_out.path());
+    let out = TempDir::new().unwrap();
+    let before = scan_to_csv(before_tree.path(), out.path(), "before");
+    let after = scan_to_csv(after_tree.path(), out.path(), "after");
 
     let diff = compare(
         &read_scan_csv(&before).unwrap(),
@@ -175,7 +161,7 @@ fn the_diff_mode_runs_end_to_end_without_a_path() {
     fs::write(tree.path().join("a.txt"), vec![b'x'; 100]).unwrap();
 
     let out = TempDir::new().unwrap();
-    let csv = scan_to_csv(tree.path(), out.path());
+    let csv = scan_to_csv(tree.path(), out.path(), "scan");
 
     let status = Command::new(env!("CARGO_BIN_EXE_fast-walk"))
         .arg("--diff")

@@ -30,6 +30,7 @@ Run app in terminal.
         -p, --path <PATH>
         -t, --threads <THREADS>        [default: 8]
             --skip-hidden              Skip hidden files and directories
+        -o, --output <PATH>            Base name for the results files [default: timestamped]
             --top <TOP>                Largest files to report, 0 disables [default: 10]
             --hotspots <HOTSPOTS>      Small-file directories to report, 0 disables [default: 10]
             --small-under <SIZE>       What counts as a small file [default: 64K]
@@ -73,15 +74,41 @@ The CSV reports capacity and average size in bytes. The terminal table reports
 capacity in MB and scales the average to whichever unit suits it, since average
 file sizes are usually far below a megabyte.
 
-A scan writes three CSVs, sharing one name stem:
+### Where the results go
 
-| File | Contents |
-| --- | --- |
-| `results-XXXXXX.csv` | totals per extension |
-| `results-XXXXXX-age.csv` | totals per age band |
-| `results-XXXXXX-size.csv` | totals per size band |
-| `results-XXXXXX-hotspots.csv` | directories holding the most small files |
-| `results-XXXXXX-largest.csv` | the largest files found |
+A scan writes five CSVs, sharing one name stem. By default the stem is a UTC
+timestamp, so a series of scans sorts chronologically and one run never
+overwrites another:
+
+    results-20260801-160000.csv           totals per extension
+    results-20260801-160000-age.csv       totals per age band
+    results-20260801-160000-size.csv      totals per size band
+    results-20260801-160000-hotspots.csv  directories holding the most small files
+    results-20260801-160000-largest.csv   the largest files found
+
+`--output` sets the stem instead, which is what you want when something else
+has to find the files afterwards:
+
+    fast-walk -p /mnt/share -o monday
+
+    monday.csv
+    monday-age.csv
+    monday-size.csv
+    monday-hotspots.csv
+    monday-largest.csv
+
+A `.csv` extension is optional and stripped before the suffixes are added, so
+`-o monday.csv` gives `monday-age.csv` rather than `monday.csv-age.csv`. The
+value may include a directory, and the files are written there rather than to
+the working directory. `--output` applies to `--diff` too.
+
+Files are written relative to the working directory unless `--output` gives a
+path, so when scanning a network share, run from local disk or pass an
+`--output` that points there.
+
+The timestamp is to the second. Two scans started within the same second write
+the same names, and the second overwrites the first; pass `--output` if that is
+a possibility.
 
 ### By age
 

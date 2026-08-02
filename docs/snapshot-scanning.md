@@ -22,14 +22,16 @@ This page covers running it safely against SMB and NFS shares.
 **Mount read-only.** `fast-walk` never writes to the tree it scans, but
 mounting with `-o ro` removes the question entirely.
 
-**Do not let the CSV land on the share.** The results file is written to the
-*current working directory*, not next to the scanned path. `cd` somewhere local
-first:
+**Do not let the results land on the share.** They are written to the *current
+working directory*, not next to the scanned path, so either run from local disk
+or point `--output` at it:
 
 ```sh
-cd ~/scans
-fast-walk -p /mnt/snapshot
+fast-walk -p /mnt/snapshot -o ~/scans/nightly
 ```
+
+Without `--output` the files are named for the time the scan ran, which means
+repeated scans accumulate as a history rather than overwriting each other.
 
 **Size the job before committing to it.** `--max-depth` gives you a cheap feel
 for how long a full run will take:
@@ -92,8 +94,7 @@ a visibly incomplete result.
 Then scan the snapshot directly, rather than the live tree:
 
 ```sh
-cd ~/scans
-fast-walk -p /mnt/snapshot/.snapshot/nightly.0 -t 4
+fast-walk -p /mnt/snapshot/.snapshot/nightly.0 -t 4 -o ~/scans/nightly
 ```
 
 Pointing `-p` at one snapshot is much better than scanning the live root and
@@ -144,15 +145,13 @@ token has to be given exactly — shadow copies generally do not appear in a
 normal directory listing of the parent, so you cannot discover them by browsing:
 
 ```sh
-cd ~/scans
-fast-walk -p '/mnt/snapshot/@GMT-2026.08.01-02.00.00' -t 4
+fast-walk -p '/mnt/snapshot/@GMT-2026.08.01-02.00.00' -t 4 -o ~/scans/nightly
 ```
 
 Or from Windows, against the share directly:
 
 ```powershell
-cd $HOME\scans
-fast-walk.exe -p "\\fileserver\data\@GMT-2026.08.01-02.00.00" -t 4
+fast-walk.exe -p "\\fileserver\data\@GMT-2026.08.01-02.00.00" -t 4 -o $HOME\scans\nightly
 ```
 
 One SMB-specific quirk: SMB is case-insensitive, but `fast-walk` groups by the
@@ -165,22 +164,18 @@ Snapshots are what make growth measurable: two of them are two consistent
 pictures of the same share taken at known times, which is exactly what a
 comparison needs.
 
-Scan each one, keeping the results CSVs somewhere they will survive:
+Scan each one, naming the output so the files can be found again:
 
 ```sh
-cd ~/scans
-fast-walk -p /mnt/snapshot/.snapshot/weekly.1 -t 4
-mv results-*.csv baseline.csv
-
-fast-walk -p /mnt/snapshot/.snapshot/nightly.0 -t 4
-mv results-*.csv current.csv
+fast-walk -p /mnt/snapshot/.snapshot/weekly.1  -t 4 -o ~/scans/baseline
+fast-walk -p /mnt/snapshot/.snapshot/nightly.0 -t 4 -o ~/scans/current
 ```
 
 Then compare them. This reads the two files and rescans nothing, so it is
 instant and can be run long after the snapshots themselves have expired:
 
 ```sh
-fast-walk --diff baseline.csv current.csv
+fast-walk --diff ~/scans/baseline.csv ~/scans/current.csv -o ~/scans/week-on-week
 ```
 
 The output is ordered by how much capacity moved, so whatever is driving growth
