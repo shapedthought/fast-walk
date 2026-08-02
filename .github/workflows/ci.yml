@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Test, lint and format
+    # Linux only for now. Several tests are Unix-specific and skip cleanly
+    # elsewhere, but the ones covering hidden files and directory paths assume
+    # Unix conventions and have not been verified on Windows. A Windows job is
+    # worth adding, but after checking those tests there rather than landing
+    # red.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain components
+        run: rustup component add clippy rustfmt
+
+      - name: Show versions
+        run: |
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Denied on the command line rather than through RUSTFLAGS, which would
+      # also apply to dependencies and let a new compiler warning in somebody
+      # else's crate break this build.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Plain `cargo test` covers unit, integration and doc tests;
+      # `--all-targets` would quietly drop the doc tests.
+      - name: Tests
+        run: cargo test
