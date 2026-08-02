@@ -40,15 +40,40 @@ for how long a full run will take:
 fast-walk -p /mnt/snapshot -m 3
 ```
 
-**Turn the thread count down for network mounts.** The default is one thread
-per CPU, which is right for local disks. Over SMB or NFS every `stat` is a
-network round trip, and too much concurrency saturates the link or the server's
-metadata path rather than going faster. Start around `-t 4` and raise it while
-watching the server:
+**Do not expect the thread count to buy you throughput.** Sweeping `--threads`
+from 4 to 64 against a 20,000 file SMB share on a local network made no
+measurable difference, with or without attribute caching: every setting landed
+within the run to run noise. SMB returns file metadata batched with the
+directory listing, so a scan costs round trips per *directory*, not per file,
+and there is very little latency for extra threads to hide.
+
+Lower it if you want to be gentle with a busy server, which is a reasonable
+thing to want. Just do not expect it to make the scan faster:
 
 ```sh
 fast-walk -p /mnt/snapshot -t 4
 ```
+
+This was measured on a low latency local network. A high latency link would
+shift the balance towards per-file waiting, where concurrency should help more,
+but that has not been measured.
+
+**Raise `actimeo` for large scans.** This is the setting that did make a
+difference. The walk lists the entire tree before measuring any of it, so on a
+scan lasting longer than the attribute cache lifetime, every file's metadata is
+fetched once for the listing and then again for the measurement. Mounting with
+`actimeo=0` rather than the default made the same scan 2.5 times slower.
+
+Small scans finish inside the default cache lifetime and never notice. A share
+big enough to take minutes will not, so give the cache a lifetime longer than
+the scan:
+
+```sh
+sudo mount -t cifs //fileserver/data /mnt/snapshot \
+    -o ro,vers=3.0,credentials=/root/.smbcred,actimeo=60
+```
+
+A long attribute cache is safe here because a snapshot does not change.
 
 **Read the warnings.** A scan that could not see everything says so:
 
@@ -123,21 +148,40 @@ To find out which ones exist, ask the server. On a Windows file server:
 vssadmin list shadows
 ```
 
-From Linux, mount the share read-only with a credentials file so the password
-does not end up in your shell history or in `ps` output:
+From Linux, you need `cifs-utils` installed. Without it there is no
+`mount.cifs` helper, and since `credentials=` is parsed by that helper rather
+than by the kernel, the option is silently ignored: the mount is attempted with
+no username or password at all and the server rejects it. The failure looks
+like an authentication problem, which sends you looking in the wrong place.
+
+```sh
+sudo apt install cifs-utils        # or dnf install cifs-utils
+```
+
+Then mount read-only with a credentials file, so the password does not end up
+in `ps` output:
 
 ```sh
 sudo mount -t cifs //fileserver/data /mnt/snapshot \
     -o ro,vers=3.0,credentials=/root/.smbcred
+mount | grep cifs                  # confirm ro actually took
 ```
 
-Where `/root/.smbcred` is `chmod 600` and contains:
+Write the credentials file without putting the password in your shell history
+either, which a plain `echo` or `printf` would not achieve:
 
+```sh
+read -rp 'username: ' u && read -rsp 'password: ' p && echo
+printf 'username=%s\npassword=%s\n' "$u" "$p" | sudo tee /root/.smbcred >/dev/null
+sudo chmod 600 /root/.smbcred
+unset u p
 ```
-username=scanner
-password=...
-domain=EXAMPLE
-```
+
+Add a `domain=` line only if the server is domain joined. For a local account
+on a workgroup machine it is unnecessary, and a wrong value there is rejected
+as an authentication failure. If the mount fails, `sudo dmesg | tail` carries
+the real reason: `-2` is a share name that does not exist, `-13` is
+authentication.
 
 Recent kernels accept a `snapshot=` mount option to mount a specific shadow
 copy directly. Where that is unavailable, address the `@GMT` path itself. The
@@ -254,9 +298,33 @@ links heavily, so this can inflate a scan substantially.
 Both behaviours are what you want for a question like "how much data do these
 files represent"; neither answers "how much space will I free by deleting them".
 
-## Notes
+## What here has actually been tested
 
-The mount commands above are examples. Available options vary between kernel
-versions, distributions, and NAS vendors — check `man mount.cifs` and `man nfs`
-on the machine you are scanning from before running them against anything you
-care about.
+Mount options vary between kernel versions, distributions and NAS vendors, so
+check `man mount.cifs` and `man nfs` on the machine you are scanning from
+before running any of this against something you care about.
+
+Verified against a Windows Server share mounted over SMB from Linux:
+
+- The `mount -t cifs` command as written, including that `-o ro` is honoured
+- That a scan over SMB and a scan of the same tree locally on the server
+  produce identical output, down to the byte, across all five reports
+- That files carrying the Windows hidden attribute are counted over SMB just as
+  they are locally
+- The thread count and `actimeo` findings above
+
+Not verified, and written from documentation rather than practice:
+
+- Everything in the NFS section
+- The `snapshot=` mount option
+- Any of it over a high latency link
+
+## A difference worth knowing about on Windows
+
+`--skip-hidden` acts on the *name*: an entry counts as hidden if it begins with
+a dot. It does not look at the Windows hidden attribute. A file marked hidden
+with `attrib +h` is therefore still counted, while `.gitignore` is not.
+
+That is consistent between a local Windows scan and the same share read over
+SMB, so it does not make comparisons disagree, but it will surprise anyone who
+expects `--skip-hidden` to mean what Explorer means by hidden.
