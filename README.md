@@ -45,6 +45,13 @@ If a directory cannot be read it is reported as a warning and its contents are
 missing from the totals. If the path given to `--path` cannot be read at all,
 the tool exits with an error rather than reporting an empty scan.
 
+## Scanning network shares
+
+To run against an SMB or NFS share, scan a snapshot rather than the live tree:
+the results are consistent, production is left alone, and there is nothing to
+damage. See [docs/snapshot-scanning.md](docs/snapshot-scanning.md) for mounting,
+thread counts, and the snapshot directory traps to avoid.
+
 ## Output
 
 Tools outputs a CSV of the extensions arranged by quantity, also includes total capacity in bytes.
@@ -54,7 +61,17 @@ counts as `gz`. Files with no extension are grouped under `<none>`; this include
 dotfiles such as `.gitignore`, which are treated as having no extension rather
 than an extension of `gitignore`.
 
-The CSV reports capacity in bytes. The terminal table reports it in MB.
+Both the table and the CSV report the average file size for each extension, and
+the summary line reports the average across every file scanned.
+
+The CSV reports capacity and average size in bytes. The terminal table reports
+capacity in MB and scales the average to whichever unit suits it, since average
+file sizes are usually far below a megabyte.
+
+Sizes are apparent file sizes rather than space consumed on disk, and a hard
+linked file is counted once per name. See
+[docs/snapshot-scanning.md](docs/snapshot-scanning.md) for what that means when
+interpreting the totals.
 
 The top 10 files are displayed in a table in the terminal. 
 
