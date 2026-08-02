@@ -382,6 +382,39 @@ fn equally_sized_files_produce_the_same_list_on_every_run() {
 }
 
 #[test]
+fn the_thread_count_changes_nothing_about_the_results() {
+    // Both the walk and the measuring run on one pool sized by this setting,
+    // so results must not depend on how many threads did the work.
+    let dir = TempDir::new().unwrap();
+    for i in 0..200 {
+        write_file(dir.path(), &format!("d{}/f{i}.bin", i % 7), 10 + i);
+    }
+
+    let scan_with_threads = |threads: usize| {
+        scan_dir_with(
+            dir.path(),
+            ScanOptions {
+                threads,
+                ..ScanOptions::default()
+            },
+        )
+    };
+
+    let baseline = scan_with_threads(1);
+
+    for threads in [2, 4, 8] {
+        let other = scan_with_threads(threads);
+
+        assert_eq!(baseline.totals, other.totals, "{threads} threads");
+        assert_eq!(baseline.ages, other.ages, "{threads} threads");
+        assert_eq!(baseline.sizes, other.sizes, "{threads} threads");
+        assert_eq!(baseline.largest, other.largest, "{threads} threads");
+        assert_eq!(baseline.hotspots, other.hotspots, "{threads} threads");
+        assert_eq!(baseline.small_files, other.small_files, "{threads} threads");
+    }
+}
+
+#[test]
 fn files_are_bucketed_by_size() {
     let dir = TempDir::new().unwrap();
     write_file(dir.path(), "empty.bin", 0);

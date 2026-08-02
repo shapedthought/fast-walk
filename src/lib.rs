@@ -533,6 +533,17 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
     // reporting an empty scan as a success.
     std::fs::metadata(path).with_context(|| format!("cannot read path: {}", path.display()))?;
 
+    // One pool for both halves of the scan. Handing jwalk a thread count of
+    // its own while letting the measuring phase fall through to rayon's global
+    // pool meant --threads only ever governed the walk, and the measuring ran
+    // at whatever the global pool defaulted to.
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(options.threads)
+            .build()
+            .context("cannot build the thread pool")?,
+    );
+
     let mut walk_errors: Vec<String> = Vec::new();
     let mut walk_error_count = 0u64;
 
@@ -540,7 +551,12 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
         .sort(true)
         .skip_hidden(options.skip_hidden)
         .max_depth(options.max_depth)
-        .parallelism(Parallelism::RayonNewPool(options.threads))
+        .parallelism(Parallelism::RayonExistingPool {
+            pool: Arc::clone(&pool),
+            // The pool is built here and used by nothing else, so there is
+            // always a free thread and no deadlock check is needed.
+            busy_timeout: None,
+        })
         .into_iter()
         .filter_map(|entry| match entry {
             Ok(entry) => {
@@ -576,56 +592,60 @@ pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Resu
     let now = SystemTime::now();
 
     // Each rayon thread aggregates into its own accumulator and these are
-    // merged at the end, so no lock is taken on the per-file path.
-    let aggregated = files
-        .par_iter()
-        .fold(Partial::default, |mut acc: Partial, entry| {
-            progress.file_measured();
+    // merged at the end, so no lock is taken on the per-file path. Run on the
+    // pool built above rather than rayon's global one, so that --threads
+    // governs the measuring as well as the walk.
+    let aggregated = pool.install(|| {
+        files
+            .par_iter()
+            .fold(Partial::default, |mut acc: Partial, entry| {
+                progress.file_measured();
 
-            let metadata = match entry.metadata() {
-                Ok(metadata) => metadata,
-                Err(_) => {
-                    unmeasurable.fetch_add(1, Ordering::Relaxed);
-                    return acc;
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        unmeasurable.fetch_add(1, Ordering::Relaxed);
+                        return acc;
+                    }
+                };
+
+                let size = metadata.len();
+
+                acc.extensions
+                    .entry(extension_of(entry.file_name()))
+                    .or_default()
+                    .add_file(size);
+
+                // The modification time comes from the stat already performed, so
+                // the age report costs no extra syscalls.
+                acc.ages
+                    .entry(classify_age(metadata.modified().ok(), now))
+                    .or_default()
+                    .add_file(size);
+
+                acc.sizes
+                    .entry(classify_size(size))
+                    .or_default()
+                    .add_file(size);
+
+                if size <= options.small_at_or_below {
+                    acc.small_files += 1;
+                    acc.small_bytes += size;
                 }
-            };
 
-            let size = metadata.len();
+                if options.hotspots > 0 {
+                    acc.record_directory(&entry.parent_path, size, options.small_at_or_below);
+                }
 
-            acc.extensions
-                .entry(extension_of(entry.file_name()))
-                .or_default()
-                .add_file(size);
+                acc.consider(size, options.top, || entry.path());
 
-            // The modification time comes from the stat already performed, so
-            // the age report costs no extra syscalls.
-            acc.ages
-                .entry(classify_age(metadata.modified().ok(), now))
-                .or_default()
-                .add_file(size);
-
-            acc.sizes
-                .entry(classify_size(size))
-                .or_default()
-                .add_file(size);
-
-            if size <= options.small_at_or_below {
-                acc.small_files += 1;
-                acc.small_bytes += size;
-            }
-
-            if options.hotspots > 0 {
-                acc.record_directory(&entry.parent_path, size, options.small_at_or_below);
-            }
-
-            acc.consider(size, options.top, || entry.path());
-
-            acc
-        })
-        .reduce(Partial::default, |mut acc, partial| {
-            acc.merge(partial, options.top);
-            acc
-        });
+                acc
+            })
+            .reduce(Partial::default, |mut acc, partial| {
+                acc.merge(partial, options.top);
+                acc
+            })
+    });
 
     // The last directory of the final chunk is still buffered.
     let mut aggregated = aggregated;
