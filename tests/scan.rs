@@ -627,6 +627,38 @@ fn a_broken_symlink_does_not_abort_the_scan() {
 
 #[cfg(unix)]
 #[test]
+fn a_root_that_cannot_be_listed_is_an_error_not_a_zero_file_scan() {
+    // Regression: the root's own stat succeeding while listing it failed left
+    // the scan reporting zero files, a warning, and success. To anything
+    // reading the exit status that is indistinguishable from an empty share,
+    // which is how a mount with the wrong permissions looks.
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "hidden-by-permissions.txt", 10);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o000)).unwrap();
+
+    // root ignores permission bits, so the fixture would deny nothing there.
+    let denied = fs::read_dir(dir.path()).is_err();
+    if denied {
+        let err = scan(dir.path(), &ScanOptions::default(), &NoProgress)
+            .expect_err("a root that cannot be listed should fail");
+
+        assert!(
+            err.to_string().contains("cannot list"),
+            "unexpected error: {err}"
+        );
+    }
+
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    if !denied {
+        eprintln!("skipped: running with privileges that bypass permission bits");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn an_unreadable_directory_is_reported_rather_than_ignored() {
     use std::os::unix::fs::PermissionsExt;
 
