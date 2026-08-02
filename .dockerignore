@@ -9,5 +9,10 @@ target/
 results-*.csv
 diff-*.csv
 
+# Credentials for a container mount. Nothing here reaches the image, but the
+# whole context is sent to the daemon, and a password should not be.
+.smbcred
+*.cred
+
 Dockerfile
 .dockerignore

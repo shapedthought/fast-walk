@@ -7,16 +7,22 @@
 #     docker run --rm -v /srv/share:/scan:ro -v "$PWD":/out fast-walk -p /scan
 #
 # Mount a share inside the container instead of on the host. mount(2) needs
-# CAP_SYS_ADMIN, which a container does not have by default, and the mount
-# commands are the ones in docs/snapshot-scanning.md rather than a second
-# interface invented here:
+# CAP_SYS_ADMIN and mount.cifs needs CAP_DAC_READ_SEARCH, and on a Debian or
+# Ubuntu host Docker's docker-default AppArmor profile denies mount whatever
+# capabilities are held. The mount commands themselves are the ones in
+# docs/snapshot-scanning.md rather than a second interface invented here:
 #
-#     docker run --rm --cap-add SYS_ADMIN \
+#     docker run --rm --cap-add SYS_ADMIN --cap-add DAC_READ_SEARCH \
+#         --security-opt apparmor=unconfined \
 #         -v "$PWD":/out -v "$PWD/.smbcred":/creds:ro \
 #         --entrypoint bash fast-walk -c '
+#             set -euo pipefail
 #             mkdir -p /scan
 #             mount -t cifs //fileserver/data /scan -o ro,vers=3.0,credentials=/creds
 #             fast-walk -p /scan'
+#
+# set -euo pipefail is not decoration: without it a failed mount leaves
+# fast-walk scanning the empty mountpoint and reporting zero files at exit 0.
 #
 # Or take the binary and leave the image behind:
 #

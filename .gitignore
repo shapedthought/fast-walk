@@ -2,3 +2,7 @@
 *.csv
 *.txt
 .DS_Store
+
+# SMB credentials for a container mount; see the Docker section of the README.
+.smbcred
+*.cred
