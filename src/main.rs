@@ -4,10 +4,9 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::*;
 use fast_walk::diff::{self, Diff};
 use fast_walk::{scan, Progress, Scan, ScanOptions};
+use indicatif::ProgressBar;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime};
-use indicatif::ProgressBar;
-
 
 use colored::*;
 use std::path::{Path, PathBuf};
@@ -75,7 +74,11 @@ fn colour_delta(text: String, delta: i64) -> ColoredString {
 /// for the one place a date is needed.
 fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let shifted = days + 719_468;
-    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
     let day_of_era = (shifted - era * 146_097) as u64;
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
@@ -186,7 +189,10 @@ fn format_share(part: u64, whole: u64) -> String {
 }
 
 #[derive(Parser)]
-#[command(version, about = "Scan a filesystem and total up capacity by extension")]
+#[command(
+    version,
+    about = "Scan a filesystem and total up capacity by extension"
+)]
 struct Cli {
     /// Directory to scan.
     #[clap(
@@ -230,7 +236,6 @@ struct Cli {
     /// per-report suffixes are added to the name. Defaults to a timestamp.
     #[clap(short, long, value_parser, value_name = "PATH")]
     output: Option<PathBuf>,
-
 }
 
 /// Drives an `indicatif` bar. The bar cannot be built until the walk reports
@@ -336,7 +341,11 @@ fn run_scan(cli: &Cli, path: &Path) -> Result<()> {
     let files_hour = (total_files as f32 / start.elapsed().as_secs_f32()) * 3600.00;
 
     println!("\nThat took: {:?}", start.elapsed());
-    println!("Estimated files per-hour: {} {}", files_hour, emoji::travel_and_places::sky_and_weather::FIRE.glyph);
+    println!(
+        "Estimated files per-hour: {} {}",
+        files_hour,
+        emoji::travel_and_places::sky_and_weather::FIRE.glyph
+    );
 
     println!(
         "\nTotal Files: {}, Total Cap: {} MB, Average File: {}",
@@ -413,7 +422,8 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
 
     let total_cap = result.total_bytes();
     let ages = format!("{}-age.csv", stem);
-    let mut wtr = csv::Writer::from_path(&ages).with_context(|| format!("cannot write {}", ages))?;
+    let mut wtr =
+        csv::Writer::from_path(&ages).with_context(|| format!("cannot write {}", ages))?;
     wtr.write_record(["Age", "Qty", "Cap Bytes", "Avg Bytes", "Pct Of Cap"])?;
     for (age, bucket) in result.age_rows() {
         wtr.write_record(&[
@@ -428,7 +438,8 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
 
     let total_files = result.total_files();
     let sizes = format!("{}-size.csv", stem);
-    let mut wtr = csv::Writer::from_path(&sizes).with_context(|| format!("cannot write {}", sizes))?;
+    let mut wtr =
+        csv::Writer::from_path(&sizes).with_context(|| format!("cannot write {}", sizes))?;
     wtr.write_record(["Size", "Qty", "Pct Of Files", "Cap Bytes", "Pct Of Cap"])?;
     for (band, bucket) in result.size_rows() {
         wtr.write_record(&[
@@ -445,7 +456,8 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
         None
     } else {
         let path = format!("{}-hotspots.csv", stem);
-        let mut wtr = csv::Writer::from_path(&path).with_context(|| format!("cannot write {path}"))?;
+        let mut wtr =
+            csv::Writer::from_path(&path).with_context(|| format!("cannot write {path}"))?;
         wtr.write_record([
             "Directory",
             "Files",
@@ -474,7 +486,8 @@ fn write_scan_csvs(result: &Scan, stem: &str) -> Result<WrittenFiles> {
         None
     } else {
         let path = format!("{}-largest.csv", stem);
-        let mut wtr = csv::Writer::from_path(&path).with_context(|| format!("cannot write {path}"))?;
+        let mut wtr =
+            csv::Writer::from_path(&path).with_context(|| format!("cannot write {path}"))?;
         wtr.write_record(["Bytes", "Path"])?;
         for file in &result.largest {
             wtr.write_record(&[file.bytes.to_string(), file.path.display().to_string()])?;
@@ -516,7 +529,13 @@ fn print_age_table(result: &Scan) {
     }
 
     let total_cap = result.total_bytes();
-    let mut table = new_table(vec!["Age", "Quantity", "Capacity MB", "Avg Size", "% of Cap"]);
+    let mut table = new_table(vec![
+        "Age",
+        "Quantity",
+        "Capacity MB",
+        "Avg Size",
+        "% of Cap",
+    ]);
 
     for (age, bucket) in &rows {
         table.add_row(vec![
@@ -631,17 +650,17 @@ fn run_diff(before_path: &Path, after_path: &Path, output: Option<&Path>) -> Res
         after_path.display()
     );
 
-    let file_name = format!(
-        "{}.csv",
-        output_stem(output, SystemTime::now(), "diff")?
-    );
+    let file_name = format!("{}.csv", output_stem(output, SystemTime::now(), "diff")?);
     write_diff_csv(&result, &file_name)?;
 
     println!(
         "\nFiles: {} -> {} ({})",
         result.before_total.count,
         result.after_total.count,
-        colour_delta(format_delta_count(result.count_delta()), result.count_delta())
+        colour_delta(
+            format_delta_count(result.count_delta()),
+            result.count_delta()
+        )
     );
     println!(
         "Capacity: {} -> {} ({})",
@@ -697,8 +716,7 @@ fn run_diff(before_path: &Path, after_path: &Path, output: Option<&Path>) -> Res
 }
 
 fn write_diff_csv(result: &Diff, path: &str) -> Result<()> {
-    let mut wtr =
-        csv::Writer::from_path(path).with_context(|| format!("cannot write {path}"))?;
+    let mut wtr = csv::Writer::from_path(path).with_context(|| format!("cannot write {path}"))?;
     wtr.write_record([
         "Extension",
         "Qty Before",

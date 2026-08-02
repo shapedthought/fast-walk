@@ -29,7 +29,10 @@ fn every_report_is_named_from_the_output_stem() {
     let out = TempDir::new().unwrap();
     let stem = out.path().join("monday");
 
-    assert!(scan(&[Path::new("-p"), tree.path(), Path::new("-o"), &stem], out.path()));
+    assert!(scan(
+        &[Path::new("-p"), tree.path(), Path::new("-o"), &stem],
+        out.path()
+    ));
 
     for suffix in REPORTS {
         let expected = out.path().join(format!("monday{suffix}.csv"));
@@ -43,7 +46,10 @@ fn a_csv_extension_on_the_output_is_not_doubled_up() {
     let out = TempDir::new().unwrap();
     let stem = out.path().join("monday.csv");
 
-    assert!(scan(&[Path::new("-p"), tree.path(), Path::new("-o"), &stem], out.path()));
+    assert!(scan(
+        &[Path::new("-p"), tree.path(), Path::new("-o"), &stem],
+        out.path()
+    ));
 
     assert!(out.path().join("monday.csv").is_file());
     assert!(out.path().join("monday-age.csv").is_file());
@@ -61,7 +67,10 @@ fn the_output_may_name_a_different_directory() {
     let stem = elsewhere.path().join("scan");
 
     // Run from `out`, but write into `elsewhere`.
-    assert!(scan(&[Path::new("-p"), tree.path(), Path::new("-o"), &stem], out.path()));
+    assert!(scan(
+        &[Path::new("-p"), tree.path(), Path::new("-o"), &stem],
+        out.path()
+    ));
 
     assert!(elsewhere.path().join("scan.csv").is_file());
     assert!(
@@ -83,7 +92,11 @@ fn without_an_output_the_files_are_timestamped() {
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
 
-    assert_eq!(names.len(), REPORTS.len(), "expected one file per report: {names:?}");
+    assert_eq!(
+        names.len(),
+        REPORTS.len(),
+        "expected one file per report: {names:?}"
+    );
 
     // The extensions CSV carries no report suffix, so it has the shortest
     // stem. Picking it by length rather than by directory order keeps this
@@ -109,7 +122,10 @@ fn without_an_output_the_files_are_timestamped() {
     // Every report shares the one stamp, so a run's files stay together.
     for suffix in REPORTS {
         let expected = format!("results-{stamp}{suffix}.csv");
-        assert!(names.contains(&expected), "{expected} missing from {names:?}");
+        assert!(
+            names.contains(&expected),
+            "{expected} missing from {names:?}"
+        );
     }
 }
 
@@ -128,13 +144,7 @@ fn the_diff_output_can_be_named_too() {
     let diff_stem = out.path().join("weekly-diff");
 
     assert!(scan(
-        &[
-            Path::new("--diff"),
-            &csv,
-            &csv,
-            Path::new("-o"),
-            &diff_stem,
-        ],
+        &[Path::new("--diff"), &csv, &csv, Path::new("-o"), &diff_stem,],
         out.path()
     ));
 
@@ -156,7 +166,10 @@ fn an_output_that_cannot_be_written_reports_the_path() {
         .output()
         .unwrap();
 
-    assert!(!output.status.success(), "should fail on an unwritable path");
+    assert!(
+        !output.status.success(),
+        "should fail on an unwritable path"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(

@@ -57,7 +57,13 @@ fn counts_files_and_sums_sizes_per_extension() {
     let scan = scan_dir(dir.path());
     let totals = totals(&scan);
 
-    assert_eq!(totals["txt"], Bucket { count: 2, bytes: 15 });
+    assert_eq!(
+        totals["txt"],
+        Bucket {
+            count: 2,
+            bytes: 15
+        }
+    );
     assert_eq!(totals["rs"], Bucket { count: 1, bytes: 3 });
     assert_eq!(scan.total_files(), 3);
     assert_eq!(scan.total_bytes(), 18);
@@ -73,7 +79,13 @@ fn aggregates_across_nested_directories() {
 
     let scan = scan_dir(dir.path());
 
-    assert_eq!(totals(&scan)["txt"], Bucket { count: 4, bytes: 15 });
+    assert_eq!(
+        totals(&scan)["txt"],
+        Bucket {
+            count: 4,
+            bytes: 15
+        }
+    );
 }
 
 #[test]
@@ -191,7 +203,11 @@ fn rows_are_sorted_by_descending_count() {
     write_file(dir.path(), "f.txt", 1);
 
     let scan = scan_dir(dir.path());
-    let order: Vec<&str> = scan.rows().iter().map(|(extension, _)| *extension).collect();
+    let order: Vec<&str> = scan
+        .rows()
+        .iter()
+        .map(|(extension, _)| *extension)
+        .collect();
 
     assert_eq!(order, ["rs", "md", "txt"]);
 }
@@ -206,16 +222,34 @@ fn files_are_bucketed_by_how_long_ago_they_were_modified() {
 
     let scan = scan_dir(dir.path());
 
-    assert_eq!(scan.ages[&AgeBucket::UpTo30Days], Bucket { count: 1, bytes: 10 });
+    assert_eq!(
+        scan.ages[&AgeBucket::UpTo30Days],
+        Bucket {
+            count: 1,
+            bytes: 10
+        }
+    );
     assert_eq!(
         scan.ages[&AgeBucket::From30To90Days],
-        Bucket { count: 1, bytes: 20 }
+        Bucket {
+            count: 1,
+            bytes: 20
+        }
     );
     assert_eq!(
         scan.ages[&AgeBucket::From90DaysTo1Year],
-        Bucket { count: 1, bytes: 40 }
+        Bucket {
+            count: 1,
+            bytes: 40
+        }
     );
-    assert_eq!(scan.ages[&AgeBucket::Over2Years], Bucket { count: 1, bytes: 80 });
+    assert_eq!(
+        scan.ages[&AgeBucket::Over2Years],
+        Bucket {
+            count: 1,
+            bytes: 80
+        }
+    );
 }
 
 #[test]
@@ -249,7 +283,13 @@ fn a_file_modified_in_the_future_is_reported_separately() {
 
     let scan = scan_dir(dir.path());
 
-    assert_eq!(scan.ages[&AgeBucket::Future], Bucket { count: 1, bytes: 10 });
+    assert_eq!(
+        scan.ages[&AgeBucket::Future],
+        Bucket {
+            count: 1,
+            bytes: 10
+        }
+    );
 }
 
 #[test]
@@ -271,7 +311,13 @@ fn the_largest_files_are_reported_biggest_first() {
     let names: Vec<String> = scan
         .largest
         .iter()
-        .map(|file| file.path.file_name().unwrap().to_string_lossy().into_owned())
+        .map(|file| {
+            file.path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
 
     assert_eq!(names, ["huge.bin", "medium.bin"]);
@@ -523,7 +569,13 @@ fn symlinks_are_not_counted_as_files() {
 
     let scan = scan_dir(dir.path());
 
-    assert_eq!(totals(&scan)["txt"], Bucket { count: 1, bytes: 10 });
+    assert_eq!(
+        totals(&scan)["txt"],
+        Bucket {
+            count: 1,
+            bytes: 10
+        }
+    );
 }
 
 #[cfg(unix)]
@@ -531,7 +583,8 @@ fn symlinks_are_not_counted_as_files() {
 fn a_broken_symlink_does_not_abort_the_scan() {
     let dir = TempDir::new().unwrap();
     write_file(dir.path(), "real.txt", 10);
-    std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("dangling.txt")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), dir.path().join("dangling.txt"))
+        .unwrap();
 
     let scan = scan_dir(dir.path());
 

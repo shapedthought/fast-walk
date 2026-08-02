@@ -208,19 +208,13 @@ mod tests {
 
     #[test]
     fn reports_growth_and_shrinkage() {
-        let diff = compare(
-            &totals(&[("txt", 10, 1000)]),
-            &totals(&[("txt", 12, 1500)]),
-        );
+        let diff = compare(&totals(&[("txt", 10, 1000)]), &totals(&[("txt", 12, 1500)]));
 
         assert_eq!(diff.rows.len(), 1);
         assert_eq!(diff.rows[0].count_delta(), 2);
         assert_eq!(diff.rows[0].bytes_delta(), 500);
 
-        let diff = compare(
-            &totals(&[("txt", 10, 1000)]),
-            &totals(&[("txt", 4, 250)]),
-        );
+        let diff = compare(&totals(&[("txt", 10, 1000)]), &totals(&[("txt", 4, 250)]));
 
         assert_eq!(diff.rows[0].count_delta(), -6);
         assert_eq!(diff.rows[0].bytes_delta(), -750);
@@ -274,8 +268,20 @@ mod tests {
             &totals(&[("txt", 10, 1000), ("rs", 6, 700)]),
         );
 
-        assert_eq!(diff.before_total, Bucket { count: 15, bytes: 1500 });
-        assert_eq!(diff.after_total, Bucket { count: 16, bytes: 1700 });
+        assert_eq!(
+            diff.before_total,
+            Bucket {
+                count: 15,
+                bytes: 1500
+            }
+        );
+        assert_eq!(
+            diff.after_total,
+            Bucket {
+                count: 16,
+                bytes: 1700
+            }
+        );
         assert_eq!(diff.count_delta(), 1);
         assert_eq!(diff.bytes_delta(), 200);
     }

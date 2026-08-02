@@ -13,9 +13,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 #[cfg(test)]
 use std::time::Duration;
+use std::time::SystemTime;
 
 pub mod diff;
 
@@ -354,7 +354,10 @@ impl Partial {
         }
 
         if self.largest.len() < top {
-            self.largest.push(Reverse(LargestFile { path: path(), bytes }));
+            self.largest.push(Reverse(LargestFile {
+                path: path(),
+                bytes,
+            }));
             return;
         }
 
@@ -367,7 +370,13 @@ impl Partial {
             _ => {}
         }
 
-        self.absorb(LargestFile { path: path(), bytes }, top);
+        self.absorb(
+            LargestFile {
+                path: path(),
+                bytes,
+            },
+            top,
+        );
     }
 
     fn absorb(&mut self, file: LargestFile, top: usize) {
@@ -522,8 +531,7 @@ pub fn extension_of(file_name: &OsStr) -> String {
 pub fn scan(path: &Path, options: &ScanOptions, progress: &dyn Progress) -> Result<Scan> {
     // Fail loudly on a path that does not exist or cannot be read, rather than
     // reporting an empty scan as a success.
-    std::fs::metadata(path)
-        .with_context(|| format!("cannot read path: {}", path.display()))?;
+    std::fs::metadata(path).with_context(|| format!("cannot read path: {}", path.display()))?;
 
     let mut walk_errors: Vec<String> = Vec::new();
     let mut walk_error_count = 0u64;
@@ -724,7 +732,13 @@ mod tests {
 
         a.merge(b);
 
-        assert_eq!(a, Bucket { count: 3, bytes: 16 });
+        assert_eq!(
+            a,
+            Bucket {
+                count: 3,
+                bytes: 16
+            }
+        );
     }
 
     fn scan_with(totals: &[(&str, u64, u64)]) -> Scan {
@@ -865,20 +879,10 @@ mod tests {
     #[test]
     fn age_rows_come_back_in_display_order_and_skip_empty_bands() {
         let mut scan = Scan::default();
-        scan.ages.insert(
-            AgeBucket::Over2Years,
-            Bucket {
-                count: 1,
-                bytes: 1,
-            },
-        );
-        scan.ages.insert(
-            AgeBucket::UpTo30Days,
-            Bucket {
-                count: 2,
-                bytes: 2,
-            },
-        );
+        scan.ages
+            .insert(AgeBucket::Over2Years, Bucket { count: 1, bytes: 1 });
+        scan.ages
+            .insert(AgeBucket::UpTo30Days, Bucket { count: 2, bytes: 2 });
 
         let order: Vec<AgeBucket> = scan.age_rows().iter().map(|(age, _)| *age).collect();
 
@@ -1060,6 +1064,9 @@ mod tests {
         };
 
         assert_eq!(insert(["a", "b", "c"]), insert(["c", "b", "a"]));
-        assert_eq!(insert(["a", "b", "c"]), vec![file("a", 100), file("b", 100)]);
+        assert_eq!(
+            insert(["a", "b", "c"]),
+            vec![file("a", 100), file("b", 100)]
+        );
     }
 }
